@@ -1,0 +1,77 @@
+# ---------------------------
+# Python / Flask API .gitignore
+# ---------------------------
+
+# Env files (NO subir secretos)
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Virtualenvs
+venv/
+.venv/
+env/
+ENV/
+virtualenv/
+.conda/
+pip-wheel-metadata/
+
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+
+# Logs
+*.log
+logs/
+*.out
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+
+# Type checking / linting
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# OS / misc
+*.tmp
+*.temp
+
+# Flask cache / instance
+instance/
+.webassets-cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Database / local files
+*.sqlite3
+*.db
+
+# Render / local runtime (si llegas a tenerlos)
+*.pid
