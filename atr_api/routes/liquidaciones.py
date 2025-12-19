@@ -536,6 +536,7 @@ def get_liquidacion(client_id: int, liq_id: int):
     _, err = _validate_client(client_id)
     if err:
         return err
+    
 
     liq = _load_liq_with_deducciones(client_id, liq_id)
     if not liq:
@@ -549,6 +550,12 @@ def update_liquidacion(client_id: int, liq_id: int):
     _, err = _validate_client(client_id)
     if err:
         return err
+    
+    # ✅ Pago
+    if "pagado" in body:
+        liq.pagado = bool(body.get("pagado"))
+        liq.pagado_at = datetime.utcnow() if liq.pagado else None
+
 
     liq = _load_liq_with_deducciones(client_id, liq_id)
     if not liq:

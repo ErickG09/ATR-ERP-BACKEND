@@ -74,7 +74,7 @@ class Liquidacion(db.Model):
         cascade="all, delete-orphan",
         passive_deletes=True,
         order_by="LiquidacionDeduccion.id",
-    )
+    )       
 
     __table_args__ = (
         UniqueConstraint("client_id", "folio_num", name="uq_liq_client_folio_num"),
@@ -100,8 +100,6 @@ class Liquidacion(db.Model):
         ret_monto = subtotal * (ret_pct / 100.0) if self.aplica_retencion else 0.0
 
         total = subtotal + iva_monto - ret_monto
-
-        
 
         #  deducciones (operador)
         ded_total = 0.0
