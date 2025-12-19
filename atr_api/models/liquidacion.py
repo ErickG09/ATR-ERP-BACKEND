@@ -62,6 +62,10 @@ class Liquidacion(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=True, onupdate=datetime.utcnow)
 
+
+    pagado = db.Column(db.Boolean, nullable=False, default=False)
+    pagado_at = db.Column(db.DateTime, nullable=True)
+    
     #  Relación: deducciones por liquidación (tabla hija)
     deducciones = db.relationship(
         "LiquidacionDeduccion",
@@ -97,8 +101,7 @@ class Liquidacion(db.Model):
 
         total = subtotal + iva_monto - ret_monto
 
-        pagado = db.Column(db.Boolean, nullable=False, default=False)
-        pagado_at = db.Column(db.DateTime, nullable=True)
+        
 
         #  deducciones (operador)
         ded_total = 0.0
