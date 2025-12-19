@@ -276,6 +276,9 @@ def _serialize(liq: Liquidacion):
 
         "created_at": liq.created_at.isoformat() if liq.created_at else None,
         "updated_at": liq.updated_at.isoformat() if liq.updated_at else None,
+        "pagado": bool(liq.pagado),
+        "pagado_at": liq.pagado_at.isoformat() if liq.pagado_at else None,
+
     }
 
 

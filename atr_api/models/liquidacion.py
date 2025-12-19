@@ -48,10 +48,10 @@ class Liquidacion(db.Model):
     # Total "fiscal/comercial" (no lo rompemos)
     total = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
-    # ✅ NUEVO: total deducciones del operador (suma de liquidacion_deducciones)
+    #  NUEVO: total deducciones del operador (suma de liquidacion_deducciones)
     deducciones_total = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
-    # ✅ NUEVO: neto operador = subtotal - deducciones_total
+    #  NUEVO: neto operador = subtotal - deducciones_total
     neto_operador = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
     status = db.Column(db.String(16), nullable=False, default="draft")
@@ -62,7 +62,7 @@ class Liquidacion(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=True, onupdate=datetime.utcnow)
 
-    # ✅ Relación: deducciones por liquidación (tabla hija)
+    #  Relación: deducciones por liquidación (tabla hija)
     deducciones = db.relationship(
         "LiquidacionDeduccion",
         backref="liquidacion",
@@ -97,7 +97,10 @@ class Liquidacion(db.Model):
 
         total = subtotal + iva_monto - ret_monto
 
-        # ✅ deducciones (operador)
+        pagado = db.Column(db.Boolean, nullable=False, default=False)
+        pagado_at = db.Column(db.DateTime, nullable=True)
+
+        #  deducciones (operador)
         ded_total = 0.0
         try:
             for d in (self.deducciones or []):
