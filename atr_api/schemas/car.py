@@ -92,6 +92,12 @@ def sanitize_car_payload(
         raw = payload.get("operador")
         data["operador"] = "" if raw is None else str(raw).strip()
 
+        # Serie (texto opcional)
+    if not partial or "serie" in payload:
+        raw = payload.get("serie")
+        data["serie"] = "" if raw is None else str(raw).strip()
+
+
     # activo (opcional, default True)
     if not partial or "activo" in payload:
         if "activo" not in payload:
@@ -121,5 +127,6 @@ def serialize_car(car: Car) -> Dict[str, Any]:
         "lt_dies_ac": _decimal_to_float(car.lt_dies_ac),
         "ingre_acum": _decimal_to_float(car.ingre_acum),
         "operador": car.operador,
+        "serie": car.serie,
         "activo": car.activo,
     }

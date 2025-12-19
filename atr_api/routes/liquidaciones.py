@@ -4,11 +4,13 @@ from datetime import date, datetime
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy import or_
+from sqlalchemy.orm import selectinload
 
 from atr_api.extensions import db
 from atr_api.errors import ApiError
 
 from atr_api.models.liquidacion import Liquidacion, LIQ_STATUS_CHOICES
+from atr_api.models.liquidacion_deduccion import LiquidacionDeduccion
 from atr_api.models.client_counter import ClientCounter
 
 from atr_api.models.operator import Operator
@@ -24,6 +26,18 @@ liquidaciones_bp = Blueprint(
 )
 
 # ---------------- helpers ----------------
+
+# keys predefinidas (las “fijas” que tendrás en UI, incluyendo las nuevas)
+PRESET_DED_KEYS = {
+    "ayuda_escolar": "Ayuda escolar",
+    "impuestos": "Impuestos",
+    "infonavit": "Infonavit",
+    "sindicato": "Sindicato",
+    "prestamos_atr": "Préstamos ATR",
+    "fonacot": "FONACOT",
+    "pension_alimenticia": "Pensión alimenticia",
+}
+
 
 def _err(msg: str, code: int = 400):
     return jsonify({"error": msg}), code
@@ -153,7 +167,75 @@ def _validate_fk_belongs(client_id: int, operator_id: int, car_id, destination_i
         return None, None, None, None, _err(str(e), e.status_code or 400)
 
 
+def _norm_key(v) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if not s:
+        return None
+    # normaliza espacios a _
+    s = "_".join(s.split())
+    return s
+
+
+def _validate_deduccion_payload(item: dict, allow_id: bool = False):
+    """
+    Retorna (ded_id, key, label, monto) con validaciones estrictas.
+    - monto: >= 0
+    - label: obligatorio (si no viene y key es preset, se infiere)
+    - key: opcional
+    """
+    if not isinstance(item, dict):
+        raise ApiError("Deducción inválida (debe ser objeto).", status_code=400)
+
+    ded_id = None
+    if allow_id and "id" in item:
+        try:
+            ded_id = int(item.get("id"))
+        except Exception:
+            raise ApiError("Deducción id inválido.", status_code=400)
+
+    key = _norm_key(item.get("key"))
+    label = (item.get("label") or "").strip()
+
+    # si es preset y no mandan label, lo inferimos
+    if (not label) and key and key in PRESET_DED_KEYS:
+        label = PRESET_DED_KEYS[key]
+
+    if not label:
+        raise ApiError("Deducción requiere 'label'.", status_code=400)
+
+    if len(label) > 120:
+        raise ApiError("Deducción 'label' demasiado largo (máx 120).", status_code=400)
+
+    monto = _num(item.get("monto"), None)
+    if monto is None or not isinstance(monto, (int, float)):
+        raise ApiError("Deducción 'monto' inválido.", status_code=400)
+
+    if monto < 0:
+        raise ApiError("Deducción 'monto' no puede ser negativa.", status_code=400)
+
+    return ded_id, key, label, round(float(monto), 2)
+
+
+def _serialize_deduccion(d: LiquidacionDeduccion):
+    return {
+        "id": d.id,
+        "key": d.key,
+        "label": d.label,
+        "monto": float(d.monto or 0),
+        "created_at": d.created_at.isoformat() if d.created_at else None,
+        "updated_at": d.updated_at.isoformat() if d.updated_at else None,
+    }
+
+
 def _serialize(liq: Liquidacion):
+    # fuerza recálculo “in-memory” por si hay cambios de deducciones cargadas
+    try:
+        liq.recalc_totals()
+    except Exception:
+        pass
+
     return {
         "id": liq.id,
         "client_id": liq.client_id,
@@ -181,6 +263,11 @@ def _serialize(liq: Liquidacion):
         "retencion_monto": float(liq.retencion_monto or 0),
 
         "total": float(liq.total or 0),
+
+        # ✅ NUEVO
+        "deducciones_total": float(liq.deducciones_total or 0),
+        "neto_operador": float(liq.neto_operador or 0),
+        "deducciones": [_serialize_deduccion(d) for d in (liq.deducciones or [])],
 
         "status": liq.status,
         "observaciones": liq.observaciones,
@@ -220,6 +307,15 @@ def _allocate_next_folio(client_id: int) -> tuple[int, str]:
     return folio_num, folio
 
 
+def _load_liq_with_deducciones(client_id: int, liq_id: int) -> Liquidacion | None:
+    return (
+        db.session.query(Liquidacion)
+        .options(selectinload(Liquidacion.deducciones))
+        .filter(Liquidacion.id == liq_id, Liquidacion.client_id == client_id)
+        .one_or_none()
+    )
+
+
 # ---------------- endpoints ----------------
 
 @liquidaciones_bp.get("/next-folio")
@@ -249,7 +345,11 @@ def list_liquidaciones(client_id: int):
     activo = _parse_bool(request.args.get("activo"))
     search = (request.args.get("search") or "").strip()
 
-    q = db.session.query(Liquidacion).filter(Liquidacion.client_id == client_id)
+    q = (
+        db.session.query(Liquidacion)
+        .options(selectinload(Liquidacion.deducciones))
+        .filter(Liquidacion.client_id == client_id)
+    )
 
     if operator_id:
         try:
@@ -332,7 +432,7 @@ def create_liquidacion(client_id: int):
     except Exception:
         return _err("destination_id inválido.", 400)
 
-    op, car, dest, car_type_final, err_fk = _validate_fk_belongs(
+    _, _, _, car_type_final, err_fk = _validate_fk_belongs(
         client_id, operator_id, car_id, destination_id
     )
     if err_fk:
@@ -375,6 +475,13 @@ def create_liquidacion(client_id: int):
     if "car_type" in body and (body.get("car_type") not in (None, "", car_type_final)):
         return _err("No envíes 'car_type'. Se calcula automáticamente desde operador/carro.", 400)
 
+    # ✅ deducciones opcionales
+    ded_list = body.get("deducciones")
+    if ded_list is None:
+        ded_list = []
+    if not isinstance(ded_list, list):
+        return _err("deducciones debe ser una lista.", 400)
+
     try:
         folio_num, folio_auto = _allocate_next_folio(client_id)
 
@@ -398,7 +505,13 @@ def create_liquidacion(client_id: int):
             activo=activo,
         )
 
+        # insertar deducciones
+        for item in ded_list:
+            _, key, label, monto = _validate_deduccion_payload(item, allow_id=False)
+            liq.deducciones.append(LiquidacionDeduccion(key=key, label=label, monto=monto))
+
         liq.recalc_totals()
+
         db.session.add(liq)
         db.session.flush()
 
@@ -407,10 +520,12 @@ def create_liquidacion(client_id: int):
         db.session.commit()
         return jsonify(created), 201
 
+    except ApiError as e:
+        db.session.rollback()
+        return _err(str(e), e.status_code or 400)
     except Exception as e:
         db.session.rollback()
         return _err(f"No se pudo crear la liquidación. {str(e)}", 400)
-
 
 
 @liquidaciones_bp.get("/<int:liq_id>")
@@ -419,8 +534,8 @@ def get_liquidacion(client_id: int, liq_id: int):
     if err:
         return err
 
-    liq = db.session.get(Liquidacion, liq_id)
-    if not liq or int(liq.client_id) != int(client_id):
+    liq = _load_liq_with_deducciones(client_id, liq_id)
+    if not liq:
         return _err("Liquidación no encontrada.", 404)
 
     return jsonify(_serialize(liq))
@@ -432,8 +547,8 @@ def update_liquidacion(client_id: int, liq_id: int):
     if err:
         return err
 
-    liq = db.session.get(Liquidacion, liq_id)
-    if not liq or int(liq.client_id) != int(client_id):
+    liq = _load_liq_with_deducciones(client_id, liq_id)
+    if not liq:
         return _err("Liquidación no encontrada.", 404)
 
     body = request.get_json(silent=True) or {}
@@ -481,7 +596,7 @@ def update_liquidacion(client_id: int, liq_id: int):
             return _err(str(e), e.status_code or 400)
         liq.operator_id = op_id
     else:
-        op_final = db.session.get(Operator, liq.operator_id)  # debe existir históricamente
+        op_final = db.session.get(Operator, liq.operator_id)
         if not op_final:
             return _err("Operador inválido.", 400)
 
@@ -504,11 +619,9 @@ def update_liquidacion(client_id: int, liq_id: int):
         liq.car_id = car_id
     else:
         car_final = db.session.get(Car, liq.car_id) if liq.car_id is not None else None
-        # si liq.car_id existe pero el carro ya no existe, lo tratamos como inválido
         if liq.car_id is not None and not car_final:
             return _err("Carro inválido.", 400)
 
-    # Si cambió operador o cambió carro (o ambos), recalcular car_type SIEMPRE
     if operator_changed or car_changed:
         try:
             liq.car_type = _derive_car_type(op_final, car_final)
@@ -547,7 +660,7 @@ def update_liquidacion(client_id: int, liq_id: int):
             return _err("Retención % inválido (0 a 100).", 400)
         liq.retencion_pct = rp if liq.aplica_retencion else 0
 
-    # status / observaciones / activo (los dejas porque el modelo los tiene, aunque el front ya no los muestre)
+    # status / observaciones / activo
     if "status" in body:
         st = (body.get("status") or "").strip().lower()
         if st and st not in LIQ_STATUS_CHOICES:
@@ -562,6 +675,67 @@ def update_liquidacion(client_id: int, liq_id: int):
     if "activo" in body:
         liq.activo = bool(body.get("activo"))
 
+    # ------------------ ✅ DEDUCCIONES ------------------
+
+    try:
+        # 1) replace completo
+        if "deducciones" in body:
+            ded_list = body.get("deducciones") or []
+            if not isinstance(ded_list, list):
+                return _err("deducciones debe ser una lista.", 400)
+
+            # borra todo y recrea
+            liq.deducciones = []
+            db.session.flush()
+
+            for item in ded_list:
+                _, key, label, monto = _validate_deduccion_payload(item, allow_id=False)
+                liq.deducciones.append(LiquidacionDeduccion(key=key, label=label, monto=monto))
+
+        # 2) add 1
+        if "deduccion_add" in body and body.get("deduccion_add") is not None:
+            _, key, label, monto = _validate_deduccion_payload(body.get("deduccion_add"), allow_id=False)
+            liq.deducciones.append(LiquidacionDeduccion(key=key, label=label, monto=monto))
+
+        # 3) update 1 (por id)
+        if "deduccion_update" in body and body.get("deduccion_update") is not None:
+            upd = body.get("deduccion_update")
+            ded_id, key, label, monto = _validate_deduccion_payload(upd, allow_id=True)
+            if not ded_id:
+                return _err("deduccion_update requiere id.", 400)
+
+            target = None
+            for d in (liq.deducciones or []):
+                if int(d.id) == int(ded_id):
+                    target = d
+                    break
+            if not target:
+                return _err("Deducción no encontrada en esta liquidación.", 404)
+
+            target.key = key
+            target.label = label
+            target.monto = monto
+
+        # 4) delete 1 (por id)
+        if "deduccion_delete_id" in body and body.get("deduccion_delete_id") is not None:
+            try:
+                did = int(body.get("deduccion_delete_id"))
+            except Exception:
+                return _err("deduccion_delete_id inválido.", 400)
+
+            target = None
+            for d in (liq.deducciones or []):
+                if int(d.id) == int(did):
+                    target = d
+                    break
+            if not target:
+                return _err("Deducción no encontrada en esta liquidación.", 404)
+
+            db.session.delete(target)
+
+    except ApiError as e:
+        return _err(str(e), e.status_code or 400)
+
     # Recalcular totales siempre
     liq.recalc_totals()
 
@@ -571,7 +745,9 @@ def update_liquidacion(client_id: int, liq_id: int):
         db.session.rollback()
         return _err(f"No se pudo actualizar. {str(e)}", 400)
 
-    return jsonify(_serialize(liq))
+    # refresca con deducciones para asegurar serialize correcto
+    liq2 = _load_liq_with_deducciones(client_id, liq_id)
+    return jsonify(_serialize(liq2 or liq))
 
 
 @liquidaciones_bp.delete("/<int:liq_id>")
@@ -580,8 +756,8 @@ def delete_liquidacion(client_id: int, liq_id: int):
     if err:
         return err
 
-    liq = db.session.get(Liquidacion, liq_id)
-    if not liq or int(liq.client_id) != int(client_id):
+    liq = _load_liq_with_deducciones(client_id, liq_id)
+    if not liq:
         return _err("Liquidación no encontrada.", 404)
 
     hard = _parse_bool(request.args.get("hard"))

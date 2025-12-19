@@ -35,6 +35,9 @@ class Car(db.Model):
     # Nombre del operador asignado (texto, no FK por ahora)
     operador = db.Column(db.String(120), nullable=False, server_default="")
 
+    # Número de serie (opcional)
+    serie = db.Column(db.String(80), nullable=False, server_default="")
+
     # Baja lógica, por si quieres desactivar sin borrar
     activo = db.Column(db.Boolean, nullable=False, server_default="true")
 

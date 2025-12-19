@@ -1,3 +1,4 @@
+# atr_api/schemas/operator.py
 from __future__ import annotations
 
 from datetime import date
@@ -8,7 +9,10 @@ from atr_api.errors import ApiError
 from atr_api.models import Operator
 
 
+# -----------------------------------------------------------------------------
 # Campos agrupados para normalizar
+# -----------------------------------------------------------------------------
+
 NUMERIC_FIELDS = [
     "sueldo_op_1",
     "viaticos_op_1",
@@ -43,11 +47,28 @@ TEXT_FIELDS = [
     "ayuda_escolar",
     "tipo_carro",
     "observaciones",
+    # NUEVOS
+    "correo_electronico",
+    "gafete_aduana",
 ]
 
 DATE_REQUIRED = ["fecha_ingreso"]
-DATE_OPTIONAL = ["fecha_venc_licencia"]
 
+DATE_OPTIONAL = [
+    "fecha_venc_licencia",
+    # NUEVO
+    "apto_medico_licencia",
+]
+
+BOOL_OPTIONAL = [
+    # NUEVO
+    "tiene_seguro",
+]
+
+
+# -----------------------------------------------------------------------------
+# Parsers
+# -----------------------------------------------------------------------------
 
 def _parse_date(value: Any, field_name: str, required: bool) -> date | None:
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -77,6 +98,19 @@ def _parse_numeric(value: Any, field_name: str) -> Decimal:
             f"El campo '{field_name}' debe ser numérico (ej. 1234.56).", 400
         )
 
+
+def _decimal_to_float(value: Any) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# -----------------------------------------------------------------------------
+# Sanitizer
+# -----------------------------------------------------------------------------
 
 def sanitize_operator_payload(
     payload: Dict[str, Any],
@@ -117,6 +151,20 @@ def sanitize_operator_payload(
             else:
                 raise ApiError("El campo 'activo' debe ser booleano (true/false).", 400)
 
+    # NUEVO: tiene_seguro (boolean opcional)
+    for field in BOOL_OPTIONAL:
+        if partial and field not in payload:
+            continue
+        if field not in payload:
+            # Alta sin mandar -> default False
+            data[field] = False
+        else:
+            raw = payload.get(field)
+            if isinstance(raw, bool):
+                data[field] = raw
+            else:
+                raise ApiError(f"El campo '{field}' debe ser booleano (true/false).", 400)
+
     # Fechas requeridas
     for field in DATE_REQUIRED:
         if partial and field not in payload:
@@ -154,14 +202,9 @@ def sanitize_operator_payload(
     return data
 
 
-def _decimal_to_float(value: Any) -> float:
-    if value is None:
-        return 0.0
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
+# -----------------------------------------------------------------------------
+# Serializers
+# -----------------------------------------------------------------------------
 
 def serialize_operator_brief(op: Operator) -> Dict[str, Any]:
     """
@@ -172,12 +215,9 @@ def serialize_operator_brief(op: Operator) -> Dict[str, Any]:
         "client_id": op.client_id,
         "codigo": op.codigo,
         "nombre": op.nombre,
-        "fecha_ingreso": op.fecha_ingreso.isoformat()
-        if op.fecha_ingreso
-        else None,
+        "fecha_ingreso": op.fecha_ingreso.isoformat() if op.fecha_ingreso else None,
         "activo": op.activo,
 
-        # NUEVOS para el catálogo
         "domicilio": op.domicilio,
         "kms_acumulados": _decimal_to_float(op.kms_acumulados),
 
@@ -186,6 +226,7 @@ def serialize_operator_brief(op: Operator) -> Dict[str, Any]:
         "sueldo_op_2": _decimal_to_float(op.sueldo_op_2),
         "viaticos_op_2": _decimal_to_float(op.viaticos_op_2),
         "viaje_especial": _decimal_to_float(op.viaje_especial),
+
         "mexico": op.mexico,
         "exp_ver": op.exp_ver,
         "exp_lc": op.exp_lc,
@@ -202,8 +243,15 @@ def serialize_operator_brief(op: Operator) -> Dict[str, Any]:
         "resguardo": op.resguardo,
         "ayuda_escolar": op.ayuda_escolar,
         "tipo_carro": op.tipo_carro,
-    }
 
+        # NUEVOS
+        "correo_electronico": op.correo_electronico,
+        "gafete_aduana": op.gafete_aduana,
+        "apto_medico_licencia": op.apto_medico_licencia.isoformat()
+        if getattr(op, "apto_medico_licencia", None)
+        else None,
+        "tiene_seguro": bool(getattr(op, "tiene_seguro", False)),
+    }
 
 
 def serialize_operator_detail(op: Operator) -> Dict[str, Any]:
@@ -213,19 +261,28 @@ def serialize_operator_detail(op: Operator) -> Dict[str, Any]:
     data = serialize_operator_brief(op)
     data.update(
         {
-            "domicilio": op.domicilio,
             "telefono": op.telefono,
             "no_imss": op.no_imss,
             "rfc": op.rfc,
             "no_licencia": op.no_licencia,
+
             "fecha_venc_licencia": op.fecha_venc_licencia.isoformat()
             if op.fecha_venc_licencia
             else None,
-            "kms_acumulados": _decimal_to_float(op.kms_acumulados),
+
             "viaticos_por_km": _decimal_to_float(op.viaticos_por_km),
             "sueldo_por_km": _decimal_to_float(op.sueldo_por_km),
+
             "observaciones": op.observaciones,
             "status_display": op.status_display,
+
+            # NUEVOS (también en detail)
+            "correo_electronico": op.correo_electronico,
+            "gafete_aduana": op.gafete_aduana,
+            "apto_medico_licencia": op.apto_medico_licencia.isoformat()
+            if getattr(op, "apto_medico_licencia", None)
+            else None,
+            "tiene_seguro": bool(getattr(op, "tiene_seguro", False)),
         }
     )
     return data

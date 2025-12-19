@@ -33,6 +33,13 @@ class Operator(db.Model):
     rfc = db.Column(db.String(50), nullable=False, server_default="")
     no_licencia = db.Column(db.String(50), nullable=False, server_default="")
 
+    # --- NUEVOS (opcionales) ---
+    correo_electronico = db.Column(db.String(120), nullable=False, server_default="")
+    gafete_aduana = db.Column(db.String(80), nullable=False, server_default="")
+    apto_medico_licencia = db.Column(db.Date, nullable=True)
+    tiene_seguro = db.Column(db.Boolean, nullable=False, server_default="false")
+
+
     fecha_venc_licencia = db.Column(db.Date, nullable=True)
 
     # --- Campos numéricos (sueldos / viáticos / kms) ---

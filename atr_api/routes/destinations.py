@@ -9,6 +9,8 @@ from sqlalchemy.exc import IntegrityError
 from atr_api.extensions import db
 from atr_api.errors import ApiError
 from atr_api.models.destination import Destination
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 bp = Blueprint("destinations", __name__)
 
@@ -206,16 +208,59 @@ def delete_destination(client_id: int, destination_id: int):
     if not d:
         raise ApiError("Destinatario no encontrado.", status_code=404)
 
-    hard = request.args.get("hard", "0").lower() in ("1", "true", "t", "yes", "y")
+    # usa tu helper (acepta 1/true/t/yes/si)
+    hard = _to_bool(request.args.get("hard")) is True
 
     try:
         if hard:
+            # --- Precheck de dependencias (evita IntegrityError/FK) ---
+            # Nota: ajusta nombres de tabla si en tu BD son distintos.
+            # Aquí asumo: guides y liquidaciones.
+            has_guide = db.session.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM guides
+                    WHERE client_id = :cid AND destination_id = :did
+                    LIMIT 1
+                    """
+                ),
+                {"cid": client_id, "did": destination_id},
+            ).first() is not None
+
+            has_liq = db.session.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM liquidaciones
+                    WHERE client_id = :cid AND destination_id = :did
+                    LIMIT 1
+                    """
+                ),
+                {"cid": client_id, "did": destination_id},
+            ).first() is not None
+
+            if has_guide or has_liq:
+                raise ApiError(
+                    "No se puede eliminar definitivamente: este destinatario está ligado a "
+                    "Guías y/o Liquidaciones. Inactívalo (activo=false) para conservar historial.",
+                    status_code=409,
+                )
+
             db.session.delete(d)
-        else:
-            d.activo = False
+            db.session.commit()
+            return jsonify({"ok": True, "status": "deleted", "id": destination_id})
+
+        # soft delete: inactivar
+        d.activo = False
         db.session.commit()
+        return jsonify({"ok": True, "status": "inactivo", "id": destination_id})
+
     except IntegrityError:
         db.session.rollback()
-        raise ApiError("Error al inactivar/eliminar el destinatario.", status_code=500)
-
-    return jsonify({"status": "deleted" if hard else "inactivo", "id": d.id})
+        # Si cae aquí, casi seguro es FK/UNIQUE/constraint => NO debe ser 500
+        raise ApiError(
+            "No se pudo eliminar: el destinatario está referenciado por otros registros. "
+            "Inactívalo (activo=false) o elimina primero sus dependencias.",
+            status_code=409,
+        )

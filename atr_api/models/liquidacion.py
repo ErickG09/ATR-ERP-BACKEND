@@ -1,9 +1,7 @@
-# app/models/liquidacion.py
-
+# atr_api/models/liquidacion.py
 from datetime import datetime, date
 from sqlalchemy import CheckConstraint, UniqueConstraint, Index
 
-# Ajusta este import a tu proyecto
 from atr_api.extensions import db
 
 
@@ -47,7 +45,14 @@ class Liquidacion(db.Model):
     retencion_pct = db.Column(db.Numeric(6, 2), nullable=False, default=0)
     retencion_monto = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
+    # Total "fiscal/comercial" (no lo rompemos)
     total = db.Column(db.Numeric(14, 2), nullable=False, default=0)
+
+    # ✅ NUEVO: total deducciones del operador (suma de liquidacion_deducciones)
+    deducciones_total = db.Column(db.Numeric(14, 2), nullable=False, default=0)
+
+    # ✅ NUEVO: neto operador = subtotal - deducciones_total
+    neto_operador = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
     status = db.Column(db.String(16), nullable=False, default="draft")
     observaciones = db.Column(db.Text, nullable=True)
@@ -56,6 +61,16 @@ class Liquidacion(db.Model):
 
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=True, onupdate=datetime.utcnow)
+
+    # ✅ Relación: deducciones por liquidación (tabla hija)
+    deducciones = db.relationship(
+        "LiquidacionDeduccion",
+        backref="liquidacion",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="LiquidacionDeduccion.id",
+    )
 
     __table_args__ = (
         UniqueConstraint("client_id", "folio_num", name="uq_liq_client_folio_num"),
@@ -82,10 +97,23 @@ class Liquidacion(db.Model):
 
         total = subtotal + iva_monto - ret_monto
 
+        # ✅ deducciones (operador)
+        ded_total = 0.0
+        try:
+            for d in (self.deducciones or []):
+                ded_total += float(getattr(d, "monto", 0) or 0)
+        except Exception:
+            ded_total = 0.0
+
+        neto_operador = subtotal - ded_total
+
         self.subtotal = round(subtotal, 2)
         self.iva_monto = round(iva_monto, 2)
         self.retencion_monto = round(ret_monto, 2)
         self.total = round(total, 2)
+
+        self.deducciones_total = round(ded_total, 2)
+        self.neto_operador = round(neto_operador, 2)
 
     @staticmethod
     def format_folio(folio_num: int) -> str:
