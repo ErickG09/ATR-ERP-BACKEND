@@ -12,6 +12,7 @@ def register_blueprints(app: Flask) -> None:
     from .destinations import bp as destinations_bp
     from .guides import bp as guides_bp
     from .liquidaciones import liquidaciones_bp
+    from .operators_import import bp as operators_import_bp
 
     # Clientes “catálogo”
     app.register_blueprint(clients_bp, url_prefix="/api/clients")
@@ -24,3 +25,4 @@ def register_blueprints(app: Flask) -> None:
     app.register_blueprint(destinations_bp, url_prefix="/api")
     app.register_blueprint(guides_bp, url_prefix="/api")
     app.register_blueprint(liquidaciones_bp)
+    app.register_blueprint(operators_import_bp, url_prefix="/api")

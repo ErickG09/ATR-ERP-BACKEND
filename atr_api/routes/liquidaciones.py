@@ -11,6 +11,7 @@ from atr_api.errors import ApiError
 
 from atr_api.models.liquidacion import Liquidacion, LIQ_STATUS_CHOICES
 from atr_api.models.liquidacion_deduccion import LiquidacionDeduccion
+from atr_api.models.liquidacion_anticipo import LiquidacionAnticipo  # ✅ NUEVO
 from atr_api.models.client_counter import ClientCounter
 
 from atr_api.models.operator import Operator
@@ -28,12 +29,13 @@ liquidaciones_bp = Blueprint(
 # ---------------- helpers ----------------
 
 # keys predefinidas (las “fijas” que tendrás en UI, incluyendo las nuevas)
+# NOTA: "impuestos" se calcula automáticamente (6%) y el backend lo "upsertea".
 PRESET_DED_KEYS = {
     "ayuda_escolar": "Ayuda escolar",
     "impuestos": "Impuestos",
     "infonavit": "Infonavit",
     "sindicato": "Sindicato",
-    "prestamos_atr": "Préstamos ATR",
+    "imss": "IMSS",
     "fonacot": "FONACOT",
     "pension_alimenticia": "Pensión alimenticia",
 }
@@ -178,9 +180,20 @@ def _norm_key(v) -> str | None:
     return s
 
 
+def _validate_operator_slot(v) -> int:
+    try:
+        slot = int(v)
+    except Exception:
+        raise ApiError("operator_slot inválido.", status_code=400)
+    if slot not in (1, 2):
+        raise ApiError("operator_slot debe ser 1 o 2.", status_code=400)
+    return slot
+
+
 def _validate_deduccion_payload(item: dict, allow_id: bool = False):
     """
-    Retorna (ded_id, key, label, monto) con validaciones estrictas.
+    Retorna (ded_id, slot, key, label, monto) con validaciones estrictas.
+    - operator_slot: 1 o 2
     - monto: >= 0
     - label: obligatorio (si no viene y key es preset, se infiere)
     - key: opcional
@@ -194,6 +207,8 @@ def _validate_deduccion_payload(item: dict, allow_id: bool = False):
             ded_id = int(item.get("id"))
         except Exception:
             raise ApiError("Deducción id inválido.", status_code=400)
+
+    slot = _validate_operator_slot(item.get("operator_slot", 1))
 
     key = _norm_key(item.get("key"))
     label = (item.get("label") or "").strip()
@@ -215,12 +230,35 @@ def _validate_deduccion_payload(item: dict, allow_id: bool = False):
     if monto < 0:
         raise ApiError("Deducción 'monto' no puede ser negativa.", status_code=400)
 
-    return ded_id, key, label, round(float(monto), 2)
+    return ded_id, slot, key, label, round(float(monto), 2)
+
+
+def _validate_anticipo_payload(item: dict):
+    """
+    Retorna (slot, importe, recibo) con validaciones estrictas.
+    """
+    if not isinstance(item, dict):
+        raise ApiError("Anticipo inválido (debe ser objeto).", status_code=400)
+
+    slot = _validate_operator_slot(item.get("operator_slot", 1))
+
+    importe = _num(item.get("importe"), None)
+    if importe is None or not isinstance(importe, (int, float)):
+        raise ApiError("Anticipo 'importe' inválido.", status_code=400)
+    if float(importe) < 0:
+        raise ApiError("Anticipo 'importe' no puede ser negativo.", status_code=400)
+
+    recibo = (item.get("recibo") or "").strip() or None
+    if recibo and len(recibo) > 64:
+        raise ApiError("Anticipo 'recibo' demasiado largo (máx 64).", status_code=400)
+
+    return slot, round(float(importe), 2), recibo
 
 
 def _serialize_deduccion(d: LiquidacionDeduccion):
     return {
         "id": d.id,
+        "operator_slot": int(getattr(d, "operator_slot", 1) or 1),
         "key": d.key,
         "label": d.label,
         "monto": float(d.monto or 0),
@@ -229,8 +267,19 @@ def _serialize_deduccion(d: LiquidacionDeduccion):
     }
 
 
+def _serialize_anticipo(a: LiquidacionAnticipo):
+    return {
+        "id": a.id,
+        "operator_slot": int(getattr(a, "operator_slot", 1) or 1),
+        "operator_id": int(a.operator_id) if a.operator_id else None,
+        "importe": float(a.importe or 0),
+        "recibo": a.recibo,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+    }
+
+
 def _serialize(liq: Liquidacion):
-    # fuerza recálculo “in-memory” por si hay cambios de deducciones cargadas
+    # fuerza recálculo “in-memory” por si hay cambios cargados
     try:
         liq.recalc_totals()
     except Exception:
@@ -239,15 +288,15 @@ def _serialize(liq: Liquidacion):
     return {
         "id": liq.id,
         "client_id": liq.client_id,
-
         "folio_num": liq.folio_num,
         "folio": liq.folio,
         "fecha": liq.fecha.isoformat() if liq.fecha else None,
 
         "operator_id": liq.operator_id,
+        "operator2_id": getattr(liq, "operator2_id", None),
+
         "car_id": liq.car_id,
         "destination_id": liq.destination_id,
-
         "car_type": liq.car_type,
 
         "kms": float(liq.kms or 0),
@@ -264,21 +313,51 @@ def _serialize(liq: Liquidacion):
 
         "total": float(liq.total or 0),
 
-        # ✅ NUEVO
+        # snapshots + extras por operador
+        "sueldo_base_op1": float(getattr(liq, "sueldo_base_op1", 0) or 0),
+        "viaticos_base_op1": float(getattr(liq, "viaticos_base_op1", 0) or 0),
+        "sueldo_base_op2": float(getattr(liq, "sueldo_base_op2", 0) or 0),
+        "viaticos_base_op2": float(getattr(liq, "viaticos_base_op2", 0) or 0),
+
+        "maniobra_op1": float(getattr(liq, "maniobra_op1", 0) or 0),
+        "maniobra_op2": float(getattr(liq, "maniobra_op2", 0) or 0),
+        "otros_ingresos_op1": float(getattr(liq, "otros_ingresos_op1", 0) or 0),
+        "otros_ingresos_op2": float(getattr(liq, "otros_ingresos_op2", 0) or 0),
+
+        # cálculo por operador (incluye impuestos 6% como deducción automática)
+        "impuestos_op1": float(getattr(liq, "impuestos_op1", 0) or 0),
+        "impuestos_op2": float(getattr(liq, "impuestos_op2", 0) or 0),
+
+        "deducciones_total_op1": float(getattr(liq, "deducciones_total_op1", 0) or 0),
+        "deducciones_total_op2": float(getattr(liq, "deducciones_total_op2", 0) or 0),
+
+        "anticipos_total_op1": float(getattr(liq, "anticipos_total_op1", 0) or 0),
+        "anticipos_total_op2": float(getattr(liq, "anticipos_total_op2", 0) or 0),
+
+        "neto_op1": float(getattr(liq, "neto_op1", 0) or 0),
+        "neto_op2": float(getattr(liq, "neto_op2", 0) or 0),
+
+        "pago_final_op1": float(getattr(liq, "pago_final_op1", 0) or 0),
+        "pago_final_op2": float(getattr(liq, "pago_final_op2", 0) or 0),
+        "pago_final_total": float(getattr(liq, "pago_final_total", 0) or 0),
+
+        # compatibilidad anterior
         "deducciones_total": float(liq.deducciones_total or 0),
         "neto_operador": float(liq.neto_operador or 0),
+
+        # detalle
         "deducciones": [_serialize_deduccion(d) for d in (liq.deducciones or [])],
+        "anticipos": [_serialize_anticipo(a) for a in (getattr(liq, "anticipos", None) or [])],
 
         "status": liq.status,
         "observaciones": liq.observaciones,
-
         "activo": bool(liq.activo),
 
         "created_at": liq.created_at.isoformat() if liq.created_at else None,
         "updated_at": liq.updated_at.isoformat() if liq.updated_at else None,
+
         "pagado": bool(liq.pagado),
         "pagado_at": liq.pagado_at.isoformat() if liq.pagado_at else None,
-
     }
 
 
@@ -310,10 +389,16 @@ def _allocate_next_folio(client_id: int) -> tuple[int, str]:
     return folio_num, folio
 
 
-def _load_liq_with_deducciones(client_id: int, liq_id: int) -> Liquidacion | None:
+def _load_liq_full(client_id: int, liq_id: int) -> Liquidacion | None:
+    """
+    Carga liquidación con deducciones y anticipos.
+    """
     return (
         db.session.query(Liquidacion)
-        .options(selectinload(Liquidacion.deducciones))
+        .options(
+            selectinload(Liquidacion.deducciones),
+            selectinload(Liquidacion.anticipos),
+        )
         .filter(Liquidacion.id == liq_id, Liquidacion.client_id == client_id)
         .one_or_none()
     )
@@ -350,7 +435,10 @@ def list_liquidaciones(client_id: int):
 
     q = (
         db.session.query(Liquidacion)
-        .options(selectinload(Liquidacion.deducciones))
+        .options(
+            selectinload(Liquidacion.deducciones),
+            selectinload(Liquidacion.anticipos),
+        )
         .filter(Liquidacion.client_id == client_id)
     )
 
@@ -388,11 +476,7 @@ def list_liquidaciones(client_id: int):
     total = q.count()
     pages = (total + per_page - 1) // per_page
 
-    items = (
-        q.offset((page - 1) * per_page)
-         .limit(per_page)
-         .all()
-    )
+    items = q.offset((page - 1) * per_page).limit(per_page).all()
 
     return jsonify({
         "items": [_serialize(x) for x in items],
@@ -414,6 +498,8 @@ def create_liquidacion(client_id: int):
     fecha_in = (body.get("fecha") or "").strip()
 
     operator_id = body.get("operator_id")
+    operator2_id = body.get("operator2_id", None)
+
     car_id = body.get("car_id", None)
     destination_id = body.get("destination_id", None)
 
@@ -426,6 +512,14 @@ def create_liquidacion(client_id: int):
         return _err("operator_id inválido.", 400)
 
     try:
+        operator2_id = None if operator2_id in ("", None) else int(operator2_id)
+    except Exception:
+        return _err("operator2_id inválido.", 400)
+
+    if operator2_id is not None and int(operator2_id) == int(operator_id):
+        return _err("operator2_id no puede ser igual a operator_id.", 400)
+
+    try:
         car_id = None if car_id in ("", None) else int(car_id)
     except Exception:
         return _err("car_id inválido.", 400)
@@ -435,11 +529,19 @@ def create_liquidacion(client_id: int):
     except Exception:
         return _err("destination_id inválido.", 400)
 
+    # car_type se deriva con operador principal y carro
     _, _, _, car_type_final, err_fk = _validate_fk_belongs(
         client_id, operator_id, car_id, destination_id
     )
     if err_fk:
         return err_fk
+
+    # Validar existencia de operadores (op2 solo existencia)
+    try:
+        op1 = _get_operator_global(operator_id)
+        op2 = _get_operator_global(operator2_id) if operator2_id is not None else None
+    except ApiError as e:
+        return _err(str(e), e.status_code or 400)
 
     fecha = _parse_date_yyyy_mm_dd(fecha_in) if fecha_in else date.today()
     if not fecha:
@@ -478,12 +580,23 @@ def create_liquidacion(client_id: int):
     if "car_type" in body and (body.get("car_type") not in (None, "", car_type_final)):
         return _err("No envíes 'car_type'. Se calcula automáticamente desde operador/carro.", 400)
 
-    # ✅ deducciones opcionales
-    ded_list = body.get("deducciones")
-    if ded_list is None:
-        ded_list = []
+    # extras por operador (opcionales)
+    maniobra_op1 = _num(body.get("maniobra_op1"), 0.0)
+    maniobra_op2 = _num(body.get("maniobra_op2"), 0.0)
+    otros_op1 = _num(body.get("otros_ingresos_op1"), 0.0)
+    otros_op2 = _num(body.get("otros_ingresos_op2"), 0.0)
+    if min(maniobra_op1, maniobra_op2, otros_op1, otros_op2) < 0:
+        return _err("Maniobra/otros ingresos no pueden ser negativos.", 400)
+
+    # deducciones opcionales
+    ded_list = body.get("deducciones") or []
     if not isinstance(ded_list, list):
         return _err("deducciones debe ser una lista.", 400)
+
+    # anticipos opcionales
+    ant_list = body.get("anticipos") or []
+    if not isinstance(ant_list, list):
+        return _err("anticipos debe ser una lista.", 400)
 
     try:
         folio_num, folio_auto = _allocate_next_folio(client_id)
@@ -493,25 +606,76 @@ def create_liquidacion(client_id: int):
             folio_num=folio_num,
             folio=folio_auto,
             fecha=fecha,
+
             operator_id=operator_id,
+            operator2_id=operator2_id,
+
             car_id=car_id,
             destination_id=destination_id,
             car_type=car_type_final,
+
             kms=round(kms, 2),
             tarifa=tarifa,
+
             aplica_iva=aplica_iva,
             iva_pct=iva_pct if aplica_iva else 0,
             aplica_retencion=aplica_ret,
             retencion_pct=ret_pct if aplica_ret else 0,
+
             status=status,
             observaciones=observaciones,
             activo=activo,
+
+            # snapshots (op1 usa sueldo_op_1/viaticos_op_1; op2 usa sueldo_op_2/viaticos_op_2)
+            sueldo_base_op1=round(float(getattr(op1, "sueldo_op_1", 0) or 0), 2),
+            viaticos_base_op1=round(float(getattr(op1, "viaticos_op_1", 0) or 0), 2),
+
+            sueldo_base_op2=round(float(getattr(op2, "sueldo_op_2", 0) or 0), 2) if op2 else 0,
+            viaticos_base_op2=round(float(getattr(op2, "viaticos_op_2", 0) or 0), 2) if op2 else 0,
+
+            maniobra_op1=round(maniobra_op1, 2),
+            maniobra_op2=round(maniobra_op2, 2),
+            otros_ingresos_op1=round(otros_op1, 2),
+            otros_ingresos_op2=round(otros_op2, 2),
         )
 
-        # insertar deducciones
+        # insertar deducciones (permitimos, excepto impuestos: el backend lo recalcula)
         for item in ded_list:
-            _, key, label, monto = _validate_deduccion_payload(item, allow_id=False)
-            liq.deducciones.append(LiquidacionDeduccion(key=key, label=label, monto=monto))
+            _, slot, key, label, monto = _validate_deduccion_payload(item, allow_id=False)
+
+            if slot == 2 and operator2_id is None:
+                return _err("No puedes mandar deducciones operator_slot=2 sin operator2_id.", 400)
+
+            # si mandan impuestos manual, lo ignoramos (se recalcula)
+            if key == "impuestos":
+                continue
+
+            liq.deducciones.append(
+                LiquidacionDeduccion(
+                    operator_slot=slot,
+                    key=key,
+                    label=label,
+                    monto=monto,
+                )
+            )
+
+        # insertar anticipos
+        for item in ant_list:
+            slot, importe, recibo = _validate_anticipo_payload(item)
+
+            if slot == 2 and operator2_id is None:
+                return _err("No puedes mandar anticipos operator_slot=2 sin operator2_id.", 400)
+
+            snap_op_id = operator_id if slot == 1 else operator2_id
+
+            liq.anticipos.append(
+                LiquidacionAnticipo(
+                    operator_slot=slot,
+                    operator_id=snap_op_id,
+                    importe=importe,
+                    recibo=recibo,
+                )
+            )
 
         liq.recalc_totals()
 
@@ -536,9 +700,8 @@ def get_liquidacion(client_id: int, liq_id: int):
     _, err = _validate_client(client_id)
     if err:
         return err
-    
 
-    liq = _load_liq_with_deducciones(client_id, liq_id)
+    liq = _load_liq_full(client_id, liq_id)
     if not liq:
         return _err("Liquidación no encontrada.", 404)
 
@@ -550,18 +713,17 @@ def update_liquidacion(client_id: int, liq_id: int):
     _, err = _validate_client(client_id)
     if err:
         return err
-    
-    # ✅ Pago
-    if "pagado" in body:
-        liq.pagado = bool(body.get("pagado"))
-        liq.pagado_at = datetime.utcnow() if liq.pagado else None
 
+    body = request.get_json(silent=True) or {}
 
-    liq = _load_liq_with_deducciones(client_id, liq_id)
+    liq = _load_liq_full(client_id, liq_id)
     if not liq:
         return _err("Liquidación no encontrada.", 404)
 
-    body = request.get_json(silent=True) or {}
+    # ✅ Pago (FIX: body ya existe)
+    if "pagado" in body:
+        liq.pagado = bool(body.get("pagado"))
+        liq.pagado_at = datetime.utcnow() if liq.pagado else None
 
     # Bloquear car_type manual
     if "car_type" in body:
@@ -590,11 +752,12 @@ def update_liquidacion(client_id: int, liq_id: int):
 
         liq.destination_id = did
 
-    # Cambios potenciales de operador/carro: necesitamos recalcular car_type con reglas
+    # Cambios potenciales de operador/carro (car_type depende de operador principal)
     operator_changed = "operator_id" in body
     car_changed = "car_id" in body
+    operator2_changed = "operator2_id" in body
 
-    # Resolver operador final
+    # Resolver operador principal final
     if operator_changed:
         try:
             op_id = int(body.get("operator_id"))
@@ -605,10 +768,55 @@ def update_liquidacion(client_id: int, liq_id: int):
         except ApiError as e:
             return _err(str(e), e.status_code or 400)
         liq.operator_id = op_id
+        # refrescar snapshots op1
+        liq.sueldo_base_op1 = round(float(getattr(op_final, "sueldo_op_1", 0) or 0), 2)
+        liq.viaticos_base_op1 = round(float(getattr(op_final, "viaticos_op_1", 0) or 0), 2)
     else:
         op_final = db.session.get(Operator, liq.operator_id)
         if not op_final:
             return _err("Operador inválido.", 400)
+
+    # Resolver operador 2 final
+    op2_final = None
+    if operator2_changed:
+        raw = body.get("operator2_id")
+        try:
+            op2_id = None if raw in ("", None) else int(raw)
+        except Exception:
+            return _err("operator2_id inválido.", 400)
+
+        if op2_id is not None and int(op2_id) == int(liq.operator_id):
+            return _err("operator2_id no puede ser igual a operator_id.", 400)
+
+        if op2_id is not None:
+            try:
+                op2_final = _get_operator_global(op2_id)
+            except ApiError as e:
+                return _err(str(e), e.status_code or 400)
+
+        liq.operator2_id = op2_id
+
+        if op2_final:
+            liq.sueldo_base_op2 = round(float(getattr(op2_final, "sueldo_op_2", 0) or 0), 2)
+            liq.viaticos_base_op2 = round(float(getattr(op2_final, "viaticos_op_2", 0) or 0), 2)
+        else:
+            # si se elimina op2, limpiar snapshots y renglones slot 2
+            liq.sueldo_base_op2 = 0
+            liq.viaticos_base_op2 = 0
+            liq.maniobra_op2 = 0
+            liq.otros_ingresos_op2 = 0
+
+            liq.deducciones = [
+                d for d in (liq.deducciones or [])
+                if int(getattr(d, "operator_slot", 1) or 1) != 2
+            ]
+            liq.anticipos = [
+                a for a in (liq.anticipos or [])
+                if int(getattr(a, "operator_slot", 1) or 1) != 2
+            ]
+    else:
+        if getattr(liq, "operator2_id", None):
+            op2_final = db.session.get(Operator, liq.operator2_id)
 
     # Resolver carro final
     if car_changed:
@@ -685,32 +893,60 @@ def update_liquidacion(client_id: int, liq_id: int):
     if "activo" in body:
         liq.activo = bool(body.get("activo"))
 
-    # ------------------ ✅ DEDUCCIONES ------------------
+    # extras por operador
+    for f in ("maniobra_op1", "maniobra_op2", "otros_ingresos_op1", "otros_ingresos_op2"):
+        if f in body:
+            v = _num(body.get(f), 0.0)
+            if v < 0:
+                return _err(f"{f} no puede ser negativo.", 400)
+            if f.endswith("_op2") and not getattr(liq, "operator2_id", None):
+                return _err(f"No puedes enviar {f} sin operator2_id.", 400)
+            setattr(liq, f, round(v, 2))
+
+    # ------------------ ✅ DEDUCCIONES / ANTICIPOS ------------------
 
     try:
-        # 1) replace completo
+        # replace completo deducciones
         if "deducciones" in body:
             ded_list = body.get("deducciones") or []
             if not isinstance(ded_list, list):
                 return _err("deducciones debe ser una lista.", 400)
 
-            # borra todo y recrea
             liq.deducciones = []
             db.session.flush()
 
             for item in ded_list:
-                _, key, label, monto = _validate_deduccion_payload(item, allow_id=False)
-                liq.deducciones.append(LiquidacionDeduccion(key=key, label=label, monto=monto))
+                _, slot, key, label, monto = _validate_deduccion_payload(item, allow_id=False)
+                if slot == 2 and not getattr(liq, "operator2_id", None):
+                    return _err("No puedes mandar deducciones operator_slot=2 sin operator2_id.", 400)
 
-        # 2) add 1
+                # impuestos se ignora (se recalcula)
+                if key == "impuestos":
+                    continue
+
+                liq.deducciones.append(
+                    LiquidacionDeduccion(
+                        operator_slot=slot,
+                        key=key,
+                        label=label,
+                        monto=monto,
+                    )
+                )
+
+        # add 1 deducción
         if "deduccion_add" in body and body.get("deduccion_add") is not None:
-            _, key, label, monto = _validate_deduccion_payload(body.get("deduccion_add"), allow_id=False)
-            liq.deducciones.append(LiquidacionDeduccion(key=key, label=label, monto=monto))
+            _, slot, key, label, monto = _validate_deduccion_payload(body.get("deduccion_add"), allow_id=False)
+            if slot == 2 and not getattr(liq, "operator2_id", None):
+                return _err("No puedes mandar deducciones operator_slot=2 sin operator2_id.", 400)
+            if key != "impuestos":
+                liq.deducciones.append(
+                    LiquidacionDeduccion(operator_slot=slot, key=key, label=label, monto=monto)
+                )
 
-        # 3) update 1 (por id)
+        # update 1 deducción (por id)
         if "deduccion_update" in body and body.get("deduccion_update") is not None:
             upd = body.get("deduccion_update")
-            ded_id, key, label, monto = _validate_deduccion_payload(upd, allow_id=True)
+            ded_id, slot, key, label, monto = _validate_deduccion_payload(upd, allow_id=True)
             if not ded_id:
                 return _err("deduccion_update requiere id.", 400)
 
@@ -722,11 +958,19 @@ def update_liquidacion(client_id: int, liq_id: int):
             if not target:
                 return _err("Deducción no encontrada en esta liquidación.", 404)
 
+            # no permitimos modificar impuestos manualmente
+            if key == "impuestos":
+                return _err("La deducción 'impuestos' se calcula automáticamente.", 400)
+
+            if slot == 2 and not getattr(liq, "operator2_id", None):
+                return _err("No puedes mandar deducciones operator_slot=2 sin operator2_id.", 400)
+
+            target.operator_slot = slot
             target.key = key
             target.label = label
             target.monto = monto
 
-        # 4) delete 1 (por id)
+        # delete 1 deducción (por id)
         if "deduccion_delete_id" in body and body.get("deduccion_delete_id") is not None:
             try:
                 did = int(body.get("deduccion_delete_id"))
@@ -741,12 +985,74 @@ def update_liquidacion(client_id: int, liq_id: int):
             if not target:
                 return _err("Deducción no encontrada en esta liquidación.", 404)
 
+            # no permitimos borrar impuestos (se recalcula)
+            if target.key == "impuestos":
+                return _err("La deducción 'impuestos' se calcula automáticamente.", 400)
+
+            db.session.delete(target)
+
+        # replace completo anticipos
+        if "anticipos" in body:
+            ant_list = body.get("anticipos") or []
+            if not isinstance(ant_list, list):
+                return _err("anticipos debe ser una lista.", 400)
+
+            liq.anticipos = []
+            db.session.flush()
+
+            for item in ant_list:
+                slot, importe, recibo = _validate_anticipo_payload(item)
+                if slot == 2 and not getattr(liq, "operator2_id", None):
+                    return _err("No puedes mandar anticipos operator_slot=2 sin operator2_id.", 400)
+
+                snap_op_id = liq.operator_id if slot == 1 else liq.operator2_id
+
+                liq.anticipos.append(
+                    LiquidacionAnticipo(
+                        operator_slot=slot,
+                        operator_id=snap_op_id,
+                        importe=importe,
+                        recibo=recibo,
+                    )
+                )
+
+        # add 1 anticipo
+        if "anticipo_add" in body and body.get("anticipo_add") is not None:
+            slot, importe, recibo = _validate_anticipo_payload(body.get("anticipo_add"))
+            if slot == 2 and not getattr(liq, "operator2_id", None):
+                return _err("No puedes mandar anticipos operator_slot=2 sin operator2_id.", 400)
+
+            snap_op_id = liq.operator_id if slot == 1 else liq.operator2_id
+            liq.anticipos.append(
+                LiquidacionAnticipo(
+                    operator_slot=slot,
+                    operator_id=snap_op_id,
+                    importe=importe,
+                    recibo=recibo,
+                )
+            )
+
+        # delete 1 anticipo
+        if "anticipo_delete_id" in body and body.get("anticipo_delete_id") is not None:
+            try:
+                aid = int(body.get("anticipo_delete_id"))
+            except Exception:
+                return _err("anticipo_delete_id inválido.", 400)
+
+            target = None
+            for a in (liq.anticipos or []):
+                if int(a.id) == int(aid):
+                    target = a
+                    break
+            if not target:
+                return _err("Anticipo no encontrado en esta liquidación.", 404)
+
             db.session.delete(target)
 
     except ApiError as e:
         return _err(str(e), e.status_code or 400)
 
-    # Recalcular totales siempre
+    # Recalcular totales siempre (aquí se vuelve a generar impuestos 6% como deducción)
     liq.recalc_totals()
 
     try:
@@ -755,8 +1061,7 @@ def update_liquidacion(client_id: int, liq_id: int):
         db.session.rollback()
         return _err(f"No se pudo actualizar. {str(e)}", 400)
 
-    # refresca con deducciones para asegurar serialize correcto
-    liq2 = _load_liq_with_deducciones(client_id, liq_id)
+    liq2 = _load_liq_full(client_id, liq_id)
     return jsonify(_serialize(liq2 or liq))
 
 
@@ -766,7 +1071,7 @@ def delete_liquidacion(client_id: int, liq_id: int):
     if err:
         return err
 
-    liq = _load_liq_with_deducciones(client_id, liq_id)
+    liq = _load_liq_full(client_id, liq_id)
     if not liq:
         return _err("Liquidación no encontrada.", 404)
 
