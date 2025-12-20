@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 
 from atr_api.extensions import db
 
@@ -31,6 +32,8 @@ class Car(db.Model):
 
     lt_dies_ac = db.Column(db.Numeric(12, 2), nullable=False, server_default="0")
     ingre_acum = db.Column(db.Numeric(12, 2), nullable=False, server_default="0")
+
+    rendimiento_promedio = db.Column(db.Numeric(12, 4), nullable=True)
 
     # Nombre del operador asignado (texto, no FK por ahora)
     operador = db.Column(db.String(120), nullable=False, server_default="")

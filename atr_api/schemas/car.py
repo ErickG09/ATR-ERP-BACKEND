@@ -47,6 +47,25 @@ def _decimal_to_float(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
 
+def calc_rendimiento_promedio(km_acum: Any, lt_dies_ac: Any) -> Decimal | None:
+    """
+    Devuelve km/L como Decimal con 4 decimales.
+    Si lt_dies_ac <= 0 -> None
+    """
+    try:
+        km = Decimal(str(km_acum if km_acum is not None else "0"))
+        lt = Decimal(str(lt_dies_ac if lt_dies_ac is not None else "0"))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+    if lt <= 0:
+        return None
+
+    try:
+        return (km / lt).quantize(Decimal("0.0001"))
+    except Exception:
+        return None
+    
 
 def sanitize_car_payload(
     payload: Dict[str, Any],
@@ -129,4 +148,6 @@ def serialize_car(car: Car) -> Dict[str, Any]:
         "operador": car.operador,
         "serie": car.serie,
         "activo": car.activo,
+        "rendimiento_promedio": _decimal_to_float(car.rendimiento_promedio),
     }
+

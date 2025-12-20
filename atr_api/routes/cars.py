@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from atr_api.extensions import db
 from atr_api.errors import ApiError
 from atr_api.models import Car
-from atr_api.schemas.car import sanitize_car_payload, serialize_car
+from atr_api.schemas.car import sanitize_car_payload, serialize_car, calc_rendimiento_promedio
 
 bp = Blueprint("cars", __name__)
 
@@ -101,6 +101,8 @@ def create_car(client_id: int):
 
     car = Car(**data)
 
+    car.rendimiento_promedio = calc_rendimiento_promedio(car.km_acum, car.lt_dies_ac)
+
     try:
         db.session.add(car)
         db.session.commit()
@@ -139,6 +141,8 @@ def update_car(client_id: int, car_id: int):
         if key == "codigo":
             continue
         setattr(car, key, value)
+
+    car.rendimiento_promedio = calc_rendimiento_promedio(car.km_acum, car.lt_dies_ac)
 
     try:
         db.session.commit()

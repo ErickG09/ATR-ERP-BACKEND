@@ -75,3 +75,5 @@ instance/
 
 # Render / local runtime (si llegas a tenerlos)
 *.pid
+
+migrations/
