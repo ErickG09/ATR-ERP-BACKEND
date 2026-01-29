@@ -1,6 +1,9 @@
 # atr_api/routes/liquidaciones.py
 
+from __future__ import annotations
+
 from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy import or_
@@ -11,13 +14,18 @@ from atr_api.errors import ApiError
 
 from atr_api.models.liquidacion import Liquidacion, LIQ_STATUS_CHOICES
 from atr_api.models.liquidacion_deduccion import LiquidacionDeduccion
-from atr_api.models.liquidacion_anticipo import LiquidacionAnticipo  # ✅ NUEVO
+from atr_api.models.liquidacion_anticipo import LiquidacionAnticipo
 from atr_api.models.client_counter import ClientCounter
 
 from atr_api.models.operator import Operator
 from atr_api.models.car import Car
 from atr_api.models.destination import Destination
 from atr_api.models.client import Client
+
+#  NUEVO: modelos de deducciones (los 3 archivos que ya creaste deben incluir esto)
+# Ajusta el import si tus nombres de archivo/clase difieren.
+from atr_api.models.deducciones_config import ClientDeduccionesConfig
+from atr_api.models.operator_deduccion_extra import OperatorDeduccionExtra
 
 
 liquidaciones_bp = Blueprint(
@@ -39,6 +47,13 @@ PRESET_DED_KEYS = {
     "fonacot": "FONACOT",
     "pension_alimenticia": "Pensión alimenticia",
 }
+
+#  keys “fijas” que sí guardamos como renglón (impuestos NO: se recalcula en recalc_totals)
+PRESET_KEYS_NO_TAX = [k for k in PRESET_DED_KEYS.keys() if k != "impuestos"]
+
+#  prefijos de keys para identificar deducciones generadas por config
+CFG_EXTRA_KEY_PREFIX = "cfg_extra:"     # extras globales/override guardados en config
+OP_EXTRA_KEY_PREFIX = "op_extra:"       # pagos aplicados a “deudas” del operador (tabla OperatorDeduccionExtra)
 
 
 def _err(msg: str, code: int = 400):
@@ -255,6 +270,307 @@ def _validate_anticipo_payload(item: dict):
     return slot, round(float(importe), 2), recibo
 
 
+# ------------------  DEDUCCIONES CONFIG (DB) ------------------
+
+def _cfg_default() -> Dict[str, Any]:
+    # estructura “tipo frontend”, pero desde backend
+    return {
+        "global": {
+            "ayuda_escolar": "0",
+            "impuestos": "0",  # en liquidación se calcula, pero lo dejamos por compatibilidad
+            "infonavit": "0",
+            "sindicato": "0",
+            "imss": "0",
+            "fonacot": "0",
+            "pension_alimenticia": "0",
+        },
+        "global_extras": [],
+        "per_operator": {},
+    }
+
+
+def _load_cfg(client_id: int) -> Dict[str, Any]:
+    row = (
+        db.session.query(ClientDeduccionesConfig)
+        .filter(ClientDeduccionesConfig.client_id == client_id)
+        .one_or_none()
+    )
+    if not row:
+        return _cfg_default()
+
+    # Esperamos que el modelo tenga columnas JSON/Dict:
+    # - global_fields (o global)
+    # - global_extras
+    # - per_operator
+    g = getattr(row, "global_fields", None) or getattr(row, "global", None) or {}
+    ge = getattr(row, "global_extras", None) or []
+    po = getattr(row, "per_operator", None) or {}
+
+    base = _cfg_default()
+    if isinstance(g, dict):
+        base["global"].update(g)
+    if isinstance(ge, list):
+        base["global_extras"] = ge
+    if isinstance(po, dict):
+        base["per_operator"] = po
+    return base
+
+
+def _to_float_money(v: Any) -> float:
+    # config guarda strings "0" / "12.50"
+    return round(_num(v, 0.0), 2)
+
+
+def _resolve_effective_for_operator(cfg: Dict[str, Any], operator_id: int) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
+    """
+    Retorna:
+      - fields dict key->float (solo fijas)
+      - extras list [{id,label,monto,enabled}]
+    """
+    global_fields = cfg.get("global") or {}
+    global_extras = cfg.get("global_extras") or []
+    per_operator = cfg.get("per_operator") or {}
+
+    entry = per_operator.get(str(operator_id)) or {}
+    enabled = bool(entry.get("enabled") is True)
+
+    # ---- fields
+    fields: Dict[str, float] = {}
+    for k in PRESET_DED_KEYS.keys():
+        # impuestos aquí NO lo usamos para liquidación (se calcula), pero lo resolvemos por UI/compat
+        fields[k] = _to_float_money(global_fields.get(k, 0))
+
+    if enabled:
+        values = entry.get("values") or {}
+        if isinstance(values, dict):
+            for k in PRESET_DED_KEYS.keys():
+                if k in values and values.get(k) is not None:
+                    fields[k] = _to_float_money(values.get(k))
+
+    # ---- extras (merge: global_extras + operator extras override)
+    # global_extras item esperado: {id,label,monto,enabled}
+    base_map: Dict[str, Dict[str, Any]] = {}
+    if isinstance(global_extras, list):
+        for g in global_extras:
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get("id") or "").strip()
+            if not gid:
+                continue
+            base_map[gid] = {
+                "id": gid,
+                "label": str(g.get("label") or "").strip(),
+                "monto": _to_float_money(g.get("monto")),
+                "enabled": (g.get("enabled") is not False),
+            }
+
+    if enabled:
+        op_extras = entry.get("extras") or []
+        if isinstance(op_extras, list):
+            for o in op_extras:
+                if not isinstance(o, dict):
+                    continue
+                oid = str(o.get("id") or "").strip()
+                if not oid:
+                    continue
+                prev = base_map.get(oid, {"id": oid, "label": "", "monto": 0.0, "enabled": True})
+                base_map[oid] = {
+                    "id": oid,
+                    "label": str(o.get("label") or prev.get("label") or "").strip(),
+                    "monto": _to_float_money(o.get("monto") if o.get("monto") is not None else prev.get("monto")),
+                    "enabled": (o.get("enabled") if o.get("enabled") is not None else prev.get("enabled", True)),
+                }
+
+    # orden: global primero, luego nuevos
+    ordered: List[Dict[str, Any]] = []
+    global_ids = []
+    if isinstance(global_extras, list):
+        for g in global_extras:
+            if isinstance(g, dict) and g.get("id"):
+                global_ids.append(str(g.get("id")))
+    seen = set()
+
+    for gid in global_ids:
+        if gid in base_map:
+            ordered.append(base_map[gid])
+            seen.add(gid)
+
+    for k, v in base_map.items():
+        if k not in seen:
+            ordered.append(v)
+
+    # filtra a solo enabled y monto > 0 (lo que realmente suma en liquidación)
+    extras_final = []
+    for ex in ordered:
+        if not ex.get("enabled", True):
+            continue
+        if float(ex.get("monto") or 0) <= 0:
+            continue
+        if not ex.get("label"):
+            continue
+        extras_final.append(ex)
+
+    return fields, extras_final
+
+
+def _strip_generated_cfg_deducciones(liq: Liquidacion):
+    """
+    Quita renglones que son “generados por config” para poder reinsertarlos limpios:
+      - preset keys (except impuestos)
+      - cfg_extra:*
+    NO quita:
+      - impuestos (lo maneja recalc_totals)
+      - op_extra:* (pagos aplicados a saldos)
+      - deducciones manuales (key=None o keys custom)
+    """
+    kept: List[LiquidacionDeduccion] = []
+    for d in (liq.deducciones or []):
+        key = (d.key or "").strip()
+        if key in PRESET_KEYS_NO_TAX:
+            continue
+        if key.startswith(CFG_EXTRA_KEY_PREFIX):
+            continue
+        kept.append(d)
+    liq.deducciones = kept
+
+
+def _upsert_cfg_deducciones_for_slot(liq: Liquidacion, client_id: int, slot: int, operator_id: int):
+    """
+    Inserta las deducciones “fijas” (ayuda_escolar, infonavit, etc) + extras globales/override,
+    como renglones en LiquidacionDeduccion.
+    """
+    cfg = _load_cfg(client_id)
+    fields, extras = _resolve_effective_for_operator(cfg, operator_id)
+
+    #  Actualizar el catálogo del operador (campo ayuda_escolar)
+    # para que “quede guardado” donde tú quieres y luego se jale fácil.
+    try:
+        op = db.session.get(Operator, operator_id)
+        if op is not None:
+            new_ae = round(float(fields.get("ayuda_escolar", 0.0) or 0.0), 2)
+            cur_ae = round(float(getattr(op, "ayuda_escolar", 0) or 0.0), 2)
+            if new_ae != cur_ae:
+                op.ayuda_escolar = new_ae
+    except Exception:
+        # no rompemos la liquidación si por alguna razón no se puede setear
+        pass
+
+    # ---- preset keys (sin impuestos)
+    for k in PRESET_KEYS_NO_TAX:
+        monto = round(float(fields.get(k, 0.0) or 0.0), 2)
+        if monto <= 0:
+            continue
+        liq.deducciones.append(
+            LiquidacionDeduccion(
+                operator_slot=slot,
+                key=k,
+                label=PRESET_DED_KEYS.get(k, k),
+                monto=monto,
+            )
+        )
+
+    # ---- extras de config (global + override)
+    for ex in extras:
+        ex_id = str(ex.get("id") or "").strip()
+        label = str(ex.get("label") or "").strip()
+        monto = round(float(ex.get("monto") or 0.0), 2)
+        if not ex_id or not label or monto <= 0:
+            continue
+        liq.deducciones.append(
+            LiquidacionDeduccion(
+                operator_slot=slot,
+                key=f"{CFG_EXTRA_KEY_PREFIX}{ex_id}",
+                label=label,
+                monto=monto,
+            )
+        )
+
+
+def _apply_operator_extra_payments(liq: Liquidacion, client_id: int, payments: List[Dict[str, Any]]):
+    """
+    payments esperado:
+      [
+        {"operator_slot": 1, "extra_id": 123, "monto": 200},
+        {"operator_slot": 1, "extra_id": 124, "monto": 50},
+        ...
+      ]
+    Esto:
+      - disminuye saldo en OperatorDeduccionExtra (cap al saldo)
+      - crea un renglón LiquidacionDeduccion con key="op_extra:<extra_id>"
+    """
+    if not payments:
+        return
+
+    if not isinstance(payments, list):
+        raise ApiError("operator_extra_payments debe ser una lista.", status_code=400)
+
+    for item in payments:
+        if not isinstance(item, dict):
+            raise ApiError("Pago de extra inválido (debe ser objeto).", status_code=400)
+
+        slot = _validate_operator_slot(item.get("operator_slot", 1))
+        extra_id_raw = item.get("extra_id")
+        if extra_id_raw is None:
+            raise ApiError("Pago de extra requiere extra_id.", status_code=400)
+        try:
+            extra_id = int(extra_id_raw)
+        except Exception:
+            raise ApiError("extra_id inválido.", status_code=400)
+
+        monto_req = _num(item.get("monto"), None)
+        if monto_req is None:
+            raise ApiError("Pago de extra requiere monto.", status_code=400)
+        monto_req = round(float(monto_req), 2)
+        if monto_req <= 0:
+            continue
+
+        # slot -> operator_id real en esta liquidación
+        op_id = liq.operator_id if slot == 1 else getattr(liq, "operator2_id", None)
+        if slot == 2 and not op_id:
+            raise ApiError("No puedes aplicar pagos slot=2 sin operator2_id.", status_code=400)
+
+        # traer “deuda” activa
+        extra = (
+            db.session.query(OperatorDeduccionExtra)
+            .filter(
+                OperatorDeduccionExtra.id == extra_id,
+                OperatorDeduccionExtra.client_id == client_id,
+                OperatorDeduccionExtra.operator_id == int(op_id),
+                OperatorDeduccionExtra.is_active.is_(True),
+            )
+            .one_or_none()
+        )
+        if not extra:
+            raise ApiError("Deducción extra (deuda) no encontrada o no activa.", status_code=404)
+
+        saldo = round(float(getattr(extra, "saldo", 0) or 0.0), 2)
+        if saldo <= 0:
+            extra.is_active = False
+            continue
+
+        aplicado = min(monto_req, saldo)
+        aplicado = round(float(aplicado), 2)
+        if aplicado <= 0:
+            continue
+
+        # bajar saldo
+        extra.saldo = round(saldo - aplicado, 2)
+        if float(extra.saldo or 0) <= 0:
+            extra.saldo = 0
+            extra.is_active = False
+
+        # renglón en liquidación
+        label = str(getattr(extra, "label", "") or "").strip() or "Deducción extra"
+        liq.deducciones.append(
+            LiquidacionDeduccion(
+                operator_slot=slot,
+                key=f"{OP_EXTRA_KEY_PREFIX}{extra_id}",
+                label=label,
+                monto=aplicado,
+            )
+        )
+
+
 def _serialize_deduccion(d: LiquidacionDeduccion):
     return {
         "id": d.id,
@@ -291,6 +607,8 @@ def _serialize(liq: Liquidacion):
         "folio_num": liq.folio_num,
         "folio": liq.folio,
         "fecha": liq.fecha.isoformat() if liq.fecha else None,
+
+        "talon_interno": getattr(liq, "talon_interno", None),
 
         "operator_id": liq.operator_id,
         "operator2_id": getattr(liq, "operator2_id", None),
@@ -468,6 +786,7 @@ def list_liquidaciones(client_id: int):
             or_(
                 Liquidacion.folio.ilike(like),
                 Liquidacion.car_type.ilike(like),
+                Liquidacion.talon_interno.ilike(like),
             )
         )
 
@@ -489,6 +808,14 @@ def list_liquidaciones(client_id: int):
 
 @liquidaciones_bp.post("")
 def create_liquidacion(client_id: int):
+    """
+     INTEGRACIÓN DE DEDUCCIONES:
+    - Siempre agrega deducciones fijas + extras config (global / override) para slot 1 y slot 2.
+    - “impuestos” nunca se recibe del frontend (se recalcula).
+    - Soporta pagos a “deudas” del operador con body.operator_extra_payments.
+    - Si te mandan body.deducciones, solo las toma como “manuales” (custom) y nunca deja que
+      sobreescriban presets/config.
+    """
     _, err = _validate_client(client_id)
     if err:
         return err
@@ -573,6 +900,11 @@ def create_liquidacion(client_id: int):
     observaciones = body.get("observaciones")
     observaciones = (observaciones.strip() if isinstance(observaciones, str) else None) or None
 
+    talon_interno = body.get("talon_interno")
+    talon_interno = (talon_interno.strip() if isinstance(talon_interno, str) else None) or None
+    if talon_interno and len(talon_interno) > 64:
+        return _err("talon_interno demasiado largo (máx 64).", 400)
+
     activo = body.get("activo")
     activo = True if activo is None else bool(activo)
 
@@ -588,10 +920,15 @@ def create_liquidacion(client_id: int):
     if min(maniobra_op1, maniobra_op2, otros_op1, otros_op2) < 0:
         return _err("Maniobra/otros ingresos no pueden ser negativos.", 400)
 
-    # deducciones opcionales
+    # deducciones manuales (opcionales)
     ded_list = body.get("deducciones") or []
     if not isinstance(ded_list, list):
         return _err("deducciones debe ser una lista.", 400)
+
+    # pagos a deudas del operador (opcionales)
+    op_extra_payments = body.get("operator_extra_payments") or []
+    if op_extra_payments is None:
+        op_extra_payments = []
 
     # anticipos opcionales
     ant_list = body.get("anticipos") or []
@@ -605,6 +942,8 @@ def create_liquidacion(client_id: int):
             client_id=client_id,
             folio_num=folio_num,
             folio=folio_auto,
+            talon_interno=talon_interno,
+
             fecha=fecha,
 
             operator_id=operator_id,
@@ -639,17 +978,31 @@ def create_liquidacion(client_id: int):
             otros_ingresos_op2=round(otros_op2, 2),
         )
 
-        # insertar deducciones (permitimos, excepto impuestos: el backend lo recalcula)
+        # 1) DEDUCCIONES CONFIG (preset + extras global/override)
+        _upsert_cfg_deducciones_for_slot(liq, client_id, 1, operator_id)
+        if operator2_id is not None:
+            _upsert_cfg_deducciones_for_slot(liq, client_id, 2, operator2_id)
+
+        # 2) DEDUCCIONES MANUALES (custom): NO dejamos que reemplacen presets/config
         for item in ded_list:
             _, slot, key, label, monto = _validate_deduccion_payload(item, allow_id=False)
 
             if slot == 2 and operator2_id is None:
                 return _err("No puedes mandar deducciones operator_slot=2 sin operator2_id.", 400)
 
-            # si mandan impuestos manual, lo ignoramos (se recalcula)
+            # impuestos se ignora (se recalcula)
             if key == "impuestos":
                 continue
 
+            # si intenta mandar un preset, lo ignoramos: viene de config
+            if key in PRESET_KEYS_NO_TAX:
+                continue
+
+            # si intenta mandar cfg_extra, lo ignoramos: viene de config
+            if key and str(key).startswith(CFG_EXTRA_KEY_PREFIX):
+                continue
+
+            # ok: custom
             liq.deducciones.append(
                 LiquidacionDeduccion(
                     operator_slot=slot,
@@ -658,6 +1011,9 @@ def create_liquidacion(client_id: int):
                     monto=monto,
                 )
             )
+
+        # 3) PAGOS A DEUDAS (OperatorDeduccionExtra -> saldo baja y se genera renglón op_extra)
+        _apply_operator_extra_payments(liq, client_id, op_extra_payments)
 
         # insertar anticipos
         for item in ant_list:
@@ -710,6 +1066,12 @@ def get_liquidacion(client_id: int, liq_id: int):
 
 @liquidaciones_bp.patch("/<int:liq_id>")
 def update_liquidacion(client_id: int, liq_id: int):
+    """
+     INTEGRACIÓN:
+    - Antes de commit, SIEMPRE re-sincroniza preset + cfg_extras con la config actual.
+    - Mantiene deducciones manuales y op_extra:* ya aplicadas.
+    - Permite enviar operator_extra_payments también al actualizar.
+    """
     _, err = _validate_client(client_id)
     if err:
         return err
@@ -720,7 +1082,7 @@ def update_liquidacion(client_id: int, liq_id: int):
     if not liq:
         return _err("Liquidación no encontrada.", 404)
 
-    # ✅ Pago (FIX: body ya existe)
+    #  Pago
     if "pagado" in body:
         liq.pagado = bool(body.get("pagado"))
         liq.pagado_at = datetime.utcnow() if liq.pagado else None
@@ -893,6 +1255,13 @@ def update_liquidacion(client_id: int, liq_id: int):
     if "activo" in body:
         liq.activo = bool(body.get("activo"))
 
+    if "talon_interno" in body:
+        ti = body.get("talon_interno")
+        ti = (ti.strip() if isinstance(ti, str) else None) or None
+        if ti and len(ti) > 64:
+            return _err("talon_interno demasiado largo (máx 64).", 400)
+        liq.talon_interno = ti
+
     # extras por operador
     for f in ("maniobra_op1", "maniobra_op2", "otros_ingresos_op1", "otros_ingresos_op2"):
         if f in body:
@@ -903,16 +1272,25 @@ def update_liquidacion(client_id: int, liq_id: int):
                 return _err(f"No puedes enviar {f} sin operator2_id.", 400)
             setattr(liq, f, round(v, 2))
 
-    # ------------------ ✅ DEDUCCIONES / ANTICIPOS ------------------
+    # ------------------  DEDUCCIONES / ANTICIPOS ------------------
 
     try:
-        # replace completo deducciones
+        # replace completo deducciones (manuales)
         if "deducciones" in body:
             ded_list = body.get("deducciones") or []
             if not isinstance(ded_list, list):
                 return _err("deducciones debe ser una lista.", 400)
 
-            liq.deducciones = []
+            #  OJO: aquí NO borramos todo, porque también existen op_extra:* ya aplicadas.
+            # Pero si el frontend manda "deducciones" como replace, asumimos que quiere reemplazar
+            # solo las manuales (custom) y el backend repondrá config/preset al final.
+            # Strategy: nos quedamos con deducciones op_extra:* (pagos) y luego metemos manuales.
+            kept: List[LiquidacionDeduccion] = []
+            for d in (liq.deducciones or []):
+                key = (d.key or "").strip()
+                if key.startswith(OP_EXTRA_KEY_PREFIX):
+                    kept.append(d)
+            liq.deducciones = kept
             db.session.flush()
 
             for item in ded_list:
@@ -924,6 +1302,12 @@ def update_liquidacion(client_id: int, liq_id: int):
                 if key == "impuestos":
                     continue
 
+                # presets/config se ignoran: backend los pone
+                if key in PRESET_KEYS_NO_TAX:
+                    continue
+                if key and str(key).startswith(CFG_EXTRA_KEY_PREFIX):
+                    continue
+
                 liq.deducciones.append(
                     LiquidacionDeduccion(
                         operator_slot=slot,
@@ -933,15 +1317,19 @@ def update_liquidacion(client_id: int, liq_id: int):
                     )
                 )
 
-        # add 1 deducción
+        # add 1 deducción (manual)
         if "deduccion_add" in body and body.get("deduccion_add") is not None:
             _, slot, key, label, monto = _validate_deduccion_payload(body.get("deduccion_add"), allow_id=False)
             if slot == 2 and not getattr(liq, "operator2_id", None):
                 return _err("No puedes mandar deducciones operator_slot=2 sin operator2_id.", 400)
-            if key != "impuestos":
-                liq.deducciones.append(
-                    LiquidacionDeduccion(operator_slot=slot, key=key, label=label, monto=monto)
-                )
+            if key == "impuestos":
+                return _err("La deducción 'impuestos' se calcula automáticamente.", 400)
+            if key in PRESET_KEYS_NO_TAX or (key and str(key).startswith(CFG_EXTRA_KEY_PREFIX)):
+                return _err("Esa deducción viene de la configuración (no se agrega manual).", 400)
+
+            liq.deducciones.append(
+                LiquidacionDeduccion(operator_slot=slot, key=key, label=label, monto=monto)
+            )
 
         # update 1 deducción (por id)
         if "deduccion_update" in body and body.get("deduccion_update") is not None:
@@ -958,12 +1346,23 @@ def update_liquidacion(client_id: int, liq_id: int):
             if not target:
                 return _err("Deducción no encontrada en esta liquidación.", 404)
 
-            # no permitimos modificar impuestos manualmente
-            if key == "impuestos":
+            tkey = (target.key or "").strip()
+
+            # no permitimos modificar impuestos/manualmente ni presets/config ni op_extra
+            if tkey == "impuestos":
                 return _err("La deducción 'impuestos' se calcula automáticamente.", 400)
+            if tkey in PRESET_KEYS_NO_TAX or tkey.startswith(CFG_EXTRA_KEY_PREFIX):
+                return _err("Esa deducción viene de la configuración (no se edita manual).", 400)
+            if tkey.startswith(OP_EXTRA_KEY_PREFIX):
+                return _err("Esa deducción es un pago aplicado a una deuda (no se edita manual).", 400)
 
             if slot == 2 and not getattr(liq, "operator2_id", None):
                 return _err("No puedes mandar deducciones operator_slot=2 sin operator2_id.", 400)
+
+            if key == "impuestos":
+                return _err("La deducción 'impuestos' se calcula automáticamente.", 400)
+            if key in PRESET_KEYS_NO_TAX or (key and str(key).startswith(CFG_EXTRA_KEY_PREFIX)):
+                return _err("No puedes convertirla a una deducción de configuración.", 400)
 
             target.operator_slot = slot
             target.key = key
@@ -985,11 +1384,19 @@ def update_liquidacion(client_id: int, liq_id: int):
             if not target:
                 return _err("Deducción no encontrada en esta liquidación.", 404)
 
-            # no permitimos borrar impuestos (se recalcula)
-            if target.key == "impuestos":
+            tkey = (target.key or "").strip()
+            if tkey == "impuestos":
                 return _err("La deducción 'impuestos' se calcula automáticamente.", 400)
+            if tkey in PRESET_KEYS_NO_TAX or tkey.startswith(CFG_EXTRA_KEY_PREFIX):
+                return _err("Esa deducción viene de la configuración (no se borra manual).", 400)
+            if tkey.startswith(OP_EXTRA_KEY_PREFIX):
+                return _err("Esa deducción es un pago aplicado (no se borra manual).", 400)
 
             db.session.delete(target)
+
+        #  aplicar pagos a deudas también en UPDATE
+        if "operator_extra_payments" in body and body.get("operator_extra_payments") is not None:
+            _apply_operator_extra_payments(liq, client_id, body.get("operator_extra_payments") or [])
 
         # replace completo anticipos
         if "anticipos" in body:
@@ -1049,6 +1456,15 @@ def update_liquidacion(client_id: int, liq_id: int):
 
             db.session.delete(target)
 
+    except ApiError as e:
+        return _err(str(e), e.status_code or 400)
+
+    #  SIEMPRE re-sincroniza deducciones generadas por config (preset + cfg_extra)
+    try:
+        _strip_generated_cfg_deducciones(liq)
+        _upsert_cfg_deducciones_for_slot(liq, client_id, 1, int(liq.operator_id))
+        if getattr(liq, "operator2_id", None):
+            _upsert_cfg_deducciones_for_slot(liq, client_id, 2, int(liq.operator2_id))
     except ApiError as e:
         return _err(str(e), e.status_code or 400)
 

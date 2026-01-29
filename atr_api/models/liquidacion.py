@@ -16,6 +16,8 @@ class Liquidacion(db.Model):
     folio_num = db.Column(db.Integer, nullable=False)
     folio = db.Column(db.String(32), nullable=False)
 
+    talon_interno = db.Column(db.String(64), nullable=True)  # NUEVO
+
     fecha = db.Column(db.Date, nullable=False, default=date.today)
 
     # Operadores
@@ -119,6 +121,7 @@ class Liquidacion(db.Model):
         Index("ix_liq_client_fecha", "client_id", "fecha"),
         Index("ix_liq_client_status", "client_id", "status"),
         Index("ix_liq_client_activo", "client_id", "activo"),
+        Index("ix_liq_client_talon", "client_id", "talon_interno"),
     )
 
     def recalc_totals(self):

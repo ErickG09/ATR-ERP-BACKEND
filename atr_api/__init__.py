@@ -17,7 +17,6 @@ def create_app() -> Flask:
     db.init_app(app)
     migrate.init_app(app, db)
 
-    # ---- CORS GLOBAL PARA /api/* ----
     cors_origins = app.config.get("CORS_ORIGINS") or [
         "http://localhost:3000",
         "http://127.0.0.1:3000",

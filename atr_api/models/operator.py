@@ -1,3 +1,4 @@
+# atr_api/models/operator.py
 from __future__ import annotations
 
 from datetime import date
@@ -39,52 +40,42 @@ class Operator(db.Model):
     apto_medico_licencia = db.Column(db.Date, nullable=True)
     tiene_seguro = db.Column(db.Boolean, nullable=False, server_default="false")
 
-
     fecha_venc_licencia = db.Column(db.Date, nullable=True)
 
     # --- Campos numéricos (sueldos / viáticos / kms) ---
-    sueldo_op_1 = db.Column(
-        db.Numeric(10, 2), nullable=False, server_default="0"
-    )
-    viaticos_op_1 = db.Column(
-        db.Numeric(10, 2), nullable=False, server_default="0"
-    )
-    sueldo_op_2 = db.Column(
-        db.Numeric(10, 2), nullable=False, server_default="0"
-    )
-    viaticos_op_2 = db.Column(
-        db.Numeric(10, 2), nullable=False, server_default="0"
-    )
-    viaje_especial = db.Column(
-        db.Numeric(10, 2), nullable=False, server_default="0"
-    )
+    sueldo_op_1 = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    viaticos_op_1 = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    sueldo_op_2 = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    viaticos_op_2 = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    viaje_especial = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
 
-    kms_acumulados = db.Column(
-        db.Numeric(12, 2), nullable=False, server_default="0"
-    )
-    viaticos_por_km = db.Column(
-        db.Numeric(10, 4), nullable=False, server_default="0"
-    )
-    sueldo_por_km = db.Column(
-        db.Numeric(10, 4), nullable=False, server_default="0"
-    )
+    kms_acumulados = db.Column(db.Numeric(12, 2), nullable=False, server_default="0")
 
-    # --- Campos de catálogo (texto, no booleanos) ---
-    mexico = db.Column(db.String(20), nullable=False, server_default="")
-    exp_ver = db.Column(db.String(20), nullable=False, server_default="")
-    exp_lc = db.Column(db.String(20), nullable=False, server_default="")
-    exp_tux = db.Column(db.String(20), nullable=False, server_default="")
-    importado = db.Column(db.String(20), nullable=False, server_default="")
-    local = db.Column(db.String(20), nullable=False, server_default="")
-    patios = db.Column(db.String(20), nullable=False, server_default="")
-    slp_altamira = db.Column(db.String(20), nullable=False, server_default="")
-    ramos_altamira = db.Column(db.String(20), nullable=False, server_default="")
-    slp_lc = db.Column(db.String(20), nullable=False, server_default="")
-    sal_lzc = db.Column(db.String(20), nullable=False, server_default="")
-    sal_ver = db.Column(db.String(20), nullable=False, server_default="")
-    sal_altamira = db.Column(db.String(20), nullable=False, server_default="")
-    resguardo = db.Column(db.String(20), nullable=False, server_default="")
-    ayuda_escolar = db.Column(db.String(20), nullable=False, server_default="")
+    # Estos ya estaban “bien” para ti (4 decimales)
+    viaticos_por_km = db.Column(db.Numeric(10, 4), nullable=False, server_default="0")
+    sueldo_por_km = db.Column(db.Numeric(10, 4), nullable=False, server_default="0")
+
+    # -------------------------------------------------------------------------
+    # Antes eran String(20). Ahora quedan como NUMERIC(10,2) para 2 decimales.
+    # -------------------------------------------------------------------------
+    mexico = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    exp_ver = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    exp_lc = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    exp_tux = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    importado = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    local = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    patios = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    slp_altamira = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    ramos_altamira = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    slp_lc = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    sal_lzc = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    sal_ver = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    sal_altamira = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+    resguardo = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+
+    ayuda_escolar = db.Column(db.Numeric(10, 2), nullable=False, server_default="0")
+
+    # Sigue siendo texto
     tipo_carro = db.Column(db.String(50), nullable=False, server_default="")
 
     observaciones = db.Column(db.Text, nullable=True)
@@ -100,7 +91,6 @@ class Operator(db.Model):
         lazy="dynamic",
         cascade="all, delete-orphan",
     )
-
 
     def __repr__(self) -> str:
         return f"<Operator id={self.id} codigo={self.codigo!r} client_id={self.client_id}>"

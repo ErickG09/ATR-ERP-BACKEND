@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict
 
 from atr_api.errors import ApiError
@@ -13,6 +13,7 @@ from atr_api.models import Operator
 # Campos agrupados para normalizar
 # -----------------------------------------------------------------------------
 
+# Estos YA son numéricos en DB (según tu modelo)
 NUMERIC_FIELDS = [
     "sueldo_op_1",
     "viaticos_op_1",
@@ -24,12 +25,8 @@ NUMERIC_FIELDS = [
     "sueldo_por_km",
 ]
 
-TEXT_FIELDS = [
-    "domicilio",
-    "telefono",
-    "no_imss",
-    "rfc",
-    "no_licencia",
+# NUEVO: tarifas/rates de catálogo (ANTES eran texto, AHORA deben ser Numeric(10,2))
+CATALOG_RATE_FIELDS_2DP = [
     "mexico",
     "exp_ver",
     "exp_lc",
@@ -44,7 +41,20 @@ TEXT_FIELDS = [
     "sal_ver",
     "sal_altamira",
     "resguardo",
+]
+
+# NUEVO: también debe ser numérico (2 decimales) si así lo cambiaste en el modelo
+CATALOG_MONEY_FIELDS_2DP = [
     "ayuda_escolar",
+]
+
+# Texto real (NO numéricos)
+TEXT_FIELDS = [
+    "domicilio",
+    "telefono",
+    "no_imss",
+    "rfc",
+    "no_licencia",
     "tipo_carro",
     "observaciones",
     # NUEVOS
@@ -56,12 +66,10 @@ DATE_REQUIRED = ["fecha_ingreso"]
 
 DATE_OPTIONAL = [
     "fecha_venc_licencia",
-    # NUEVO
     "apto_medico_licencia",
 ]
 
 BOOL_OPTIONAL = [
-    # NUEVO
     "tiene_seguro",
 ]
 
@@ -82,29 +90,67 @@ def _parse_date(value: Any, field_name: str, required: bool) -> date | None:
     try:
         return date.fromisoformat(str(value))
     except ValueError:
-        raise ApiError(
-            f"El campo '{field_name}' debe tener formato 'YYYY-MM-DD'.", 400
-        )
+        raise ApiError(f"El campo '{field_name}' debe tener formato 'YYYY-MM-DD'.", 400)
 
 
-def _parse_numeric(value: Any, field_name: str) -> Decimal:
+def _normalize_numeric_string(value: Any) -> str:
+    """
+    Normaliza strings tipo Excel/UI: "$1,234.50", "  12,3 ", etc.
+    - Quita $ y comas
+    - Quita espacios
+    - Deja dígitos, punto y signo -
+    """
+    s = str(value).strip()
+    s = s.replace("$", "").replace(",", "").replace(" ", "")
+    # permite negativos
+    return s
+
+
+def _parse_decimal(value: Any, field_name: str) -> Decimal:
+    """
+    Convierte a Decimal:
+    - None o "" => 0
+    - Acepta strings con $ y comas
+    """
     if value is None or (isinstance(value, str) and not value.strip()):
         return Decimal("0")
 
     try:
-        return Decimal(str(value))
+        if isinstance(value, (int, float, Decimal)):
+            return Decimal(str(value))
+        s = _normalize_numeric_string(value)
+        return Decimal(s)
     except (InvalidOperation, ValueError):
-        raise ApiError(
-            f"El campo '{field_name}' debe ser numérico (ej. 1234.56).", 400
-        )
+        raise ApiError(f"El campo '{field_name}' debe ser numérico (ej. 1234.56).", 400)
 
 
-def _decimal_to_float(value: Any) -> float:
+def _quantize_2dp(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _quantize_4dp(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+
+
+def _decimal_to_float_2dp(value: Any) -> float:
     if value is None:
         return 0.0
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        d = Decimal(str(value))
+        d = _quantize_2dp(d)
+        return float(d)
+    except (InvalidOperation, TypeError, ValueError):
+        return 0.0
+
+
+def _decimal_to_float_4dp(value: Any) -> float:
+    if value is None:
+        return 0.0
+    try:
+        d = Decimal(str(value))
+        d = _quantize_4dp(d)
+        return float(d)
+    except (InvalidOperation, TypeError, ValueError):
         return 0.0
 
 
@@ -142,7 +188,6 @@ def sanitize_operator_payload(
     # activo (booleano real)
     if not partial or "activo" in payload:
         if "activo" not in payload:
-            # Alta sin mandar 'activo' → asumimos True
             data["activo"] = True
         else:
             raw_activo = payload.get("activo")
@@ -151,12 +196,11 @@ def sanitize_operator_payload(
             else:
                 raise ApiError("El campo 'activo' debe ser booleano (true/false).", 400)
 
-    # NUEVO: tiene_seguro (boolean opcional)
+    # tiene_seguro (boolean opcional)
     for field in BOOL_OPTIONAL:
         if partial and field not in payload:
             continue
         if field not in payload:
-            # Alta sin mandar -> default False
             data[field] = False
         else:
             raw = payload.get(field)
@@ -182,14 +226,35 @@ def sanitize_operator_payload(
         else:
             data[field] = _parse_date(raw, field, required=False)
 
-    # Campos numéricos
+    # Campos numéricos existentes (mantén su escala actual)
+    # - sueldo/viaticos/viaje/kms son 2dp
+    # - por_km son 4dp
     for field in NUMERIC_FIELDS:
         if partial and field not in payload:
             continue
         raw = payload.get(field)
-        data[field] = _parse_numeric(raw, field)
+        dec = _parse_decimal(raw, field)
 
-    # Campos de texto
+        if field in ("viaticos_por_km", "sueldo_por_km"):
+            data[field] = _quantize_4dp(dec)
+        else:
+            data[field] = _quantize_2dp(dec)
+
+    # NUEVO: catálogo rates (2dp)
+    for field in CATALOG_RATE_FIELDS_2DP:
+        if partial and field not in payload:
+            continue
+        raw = payload.get(field)
+        data[field] = _quantize_2dp(_parse_decimal(raw, field))
+
+    # NUEVO: ayuda_escolar (2dp)
+    for field in CATALOG_MONEY_FIELDS_2DP:
+        if partial and field not in payload:
+            continue
+        raw = payload.get(field)
+        data[field] = _quantize_2dp(_parse_decimal(raw, field))
+
+    # Campos de texto reales
     for field in TEXT_FIELDS:
         if partial and field not in payload:
             continue
@@ -219,29 +284,32 @@ def serialize_operator_brief(op: Operator) -> Dict[str, Any]:
         "activo": op.activo,
 
         "domicilio": op.domicilio,
-        "kms_acumulados": _decimal_to_float(op.kms_acumulados),
 
-        "sueldo_op_1": _decimal_to_float(op.sueldo_op_1),
-        "viaticos_op_1": _decimal_to_float(op.viaticos_op_1),
-        "sueldo_op_2": _decimal_to_float(op.sueldo_op_2),
-        "viaticos_op_2": _decimal_to_float(op.viaticos_op_2),
-        "viaje_especial": _decimal_to_float(op.viaje_especial),
+        "kms_acumulados": _decimal_to_float_2dp(op.kms_acumulados),
 
-        "mexico": op.mexico,
-        "exp_ver": op.exp_ver,
-        "exp_lc": op.exp_lc,
-        "exp_tux": op.exp_tux,
-        "importado": op.importado,
-        "local": op.local,
-        "patios": op.patios,
-        "slp_altamira": op.slp_altamira,
-        "ramos_altamira": op.ramos_altamira,
-        "slp_lc": op.slp_lc,
-        "sal_lzc": op.sal_lzc,
-        "sal_ver": op.sal_ver,
-        "sal_altamira": op.sal_altamira,
-        "resguardo": op.resguardo,
-        "ayuda_escolar": op.ayuda_escolar,
+        "sueldo_op_1": _decimal_to_float_2dp(op.sueldo_op_1),
+        "viaticos_op_1": _decimal_to_float_2dp(op.viaticos_op_1),
+        "sueldo_op_2": _decimal_to_float_2dp(op.sueldo_op_2),
+        "viaticos_op_2": _decimal_to_float_2dp(op.viaticos_op_2),
+        "viaje_especial": _decimal_to_float_2dp(op.viaje_especial),
+
+        # Catálogo rates (2dp) - ahora numéricos
+        "mexico": _decimal_to_float_2dp(getattr(op, "mexico", None)),
+        "exp_ver": _decimal_to_float_2dp(getattr(op, "exp_ver", None)),
+        "exp_lc": _decimal_to_float_2dp(getattr(op, "exp_lc", None)),
+        "exp_tux": _decimal_to_float_2dp(getattr(op, "exp_tux", None)),
+        "importado": _decimal_to_float_2dp(getattr(op, "importado", None)),
+        "local": _decimal_to_float_2dp(getattr(op, "local", None)),
+        "patios": _decimal_to_float_2dp(getattr(op, "patios", None)),
+        "slp_altamira": _decimal_to_float_2dp(getattr(op, "slp_altamira", None)),
+        "ramos_altamira": _decimal_to_float_2dp(getattr(op, "ramos_altamira", None)),
+        "slp_lc": _decimal_to_float_2dp(getattr(op, "slp_lc", None)),
+        "sal_lzc": _decimal_to_float_2dp(getattr(op, "sal_lzc", None)),
+        "sal_ver": _decimal_to_float_2dp(getattr(op, "sal_ver", None)),
+        "sal_altamira": _decimal_to_float_2dp(getattr(op, "sal_altamira", None)),
+        "resguardo": _decimal_to_float_2dp(getattr(op, "resguardo", None)),
+
+        "ayuda_escolar": _decimal_to_float_2dp(getattr(op, "ayuda_escolar", None)),
         "tipo_carro": op.tipo_carro,
 
         # NUEVOS
@@ -270,8 +338,9 @@ def serialize_operator_detail(op: Operator) -> Dict[str, Any]:
             if op.fecha_venc_licencia
             else None,
 
-            "viaticos_por_km": _decimal_to_float(op.viaticos_por_km),
-            "sueldo_por_km": _decimal_to_float(op.sueldo_por_km),
+            # por_km en 4dp (tal cual tu UI lo maneja con 4)
+            "viaticos_por_km": _decimal_to_float_4dp(op.viaticos_por_km),
+            "sueldo_por_km": _decimal_to_float_4dp(op.sueldo_por_km),
 
             "observaciones": op.observaciones,
             "status_display": op.status_display,

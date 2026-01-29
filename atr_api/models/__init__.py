@@ -11,6 +11,9 @@ from .guide import Guide
 from .client_counter import ClientCounter
 from .liquidacion import Liquidacion
 
+from .deducciones_config import ClientDeduccionesConfig
+from .operator_deduccion_extra import OperatorDeduccionExtra
+
 __all__ = [
     "db",
     "Client",
@@ -22,4 +25,8 @@ __all__ = [
     "Guide",
     "ClientCounter",
     "Liquidacion",
+
+    # ✅ NUEVO
+    "ClientDeduccionesConfig",
+    "OperatorDeduccionExtra",
 ]
