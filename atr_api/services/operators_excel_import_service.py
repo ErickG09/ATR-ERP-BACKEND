@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from werkzeug.datastructures import FileStorage
 from sqlalchemy.exc import IntegrityError
@@ -15,6 +16,7 @@ from atr_api.schemas.operators_excel_import import (
     parse_excel_operators,
     normalize_full_name,
     make_operator_code_generator,
+    normalize_codigo_from_excel,
 )
 
 
@@ -23,6 +25,24 @@ class RowError:
     row_number: int
     message: str
     data: Dict[str, Any]
+
+
+def _norm_rfc(value: Any) -> str:
+    if value is None:
+        return ""
+    s = str(value).strip().upper()
+    # quita espacios y guiones (y cualquier cosa rara)
+    s = re.sub(r"[^A-Z0-9Ñ&]+", "", s)
+    return s
+
+
+def _norm_imss(value: Any) -> str:
+    if value is None:
+        return ""
+    s = str(value).strip()
+    # solo dígitos
+    s = re.sub(r"\D+", "", s)
+    return s
 
 
 def import_operators_from_excel(
@@ -35,11 +55,11 @@ def import_operators_from_excel(
     """
     Lee un Excel y crea/actualiza operadores.
 
-    - codigo NO se toma del Excel; se genera por apellido inicial + consecutivo (R001…)
-    - fecha_ingreso: si no viene, se asigna hoy
-    - numéricos vacíos => 0
-    - textos vacíos => ""
-    - fechas soportan date/datetime, serial de Excel, YYYY-MM-DD, DD/MM/YYYY, etc.
+    Cambios clave:
+    - Si el Excel trae CODIGO, se respeta tal cual y se hace UPSERT por (client_id, codigo).
+      Esto evita duplicados al re-subir el mismo archivo.
+    - Si NO trae código, se genera llenando huecos por prefijo (A001..A005, saltar A006, etc.)
+    - Soporta importar tipo_carro desde Excel.
     """
     try:
         rows = parse_excel_operators(file_storage)
@@ -51,56 +71,60 @@ def import_operators_from_excel(
     if not rows:
         raise ApiError("El Excel no tiene filas de datos.", status_code=400)
 
-    # Generador de códigos robusto (consulta DB y mantiene contador por inicial)
     code_gen = make_operator_code_generator(client_id=client_id)
 
     created = 0
     updated = 0
     skipped = 0
     errors: List[RowError] = []
-
-    # Para preview cuando dry_run=1
     preview: List[Dict[str, Any]] = []
 
-    # Transacción
     try:
         for item in rows:
             row_number = item["_row_number"]
             raw_payload = dict(item["payload"])
 
-            # Nombre obligatorio (lo validará sanitize_operator_payload, pero damos error más claro)
+            # Nombre obligatorio
             nombre = normalize_full_name(raw_payload.get("nombre", ""))
             if not nombre:
-                errors.append(
-                    RowError(
-                        row_number=row_number,
-                        message="El campo 'Nombre' es obligatorio.",
-                        data=raw_payload,
-                    )
-                )
+                errors.append(RowError(row_number=row_number, message="El campo 'Nombre' es obligatorio.", data=raw_payload))
                 continue
             raw_payload["nombre"] = nombre
 
-            # fecha_ingreso no venía en tu lista, pero tu modelo la requiere.
-            # Solución: si no viene en Excel, asignamos hoy (sin tocar tus schemas actuales).
+            # Si no viene fecha_ingreso, asignamos hoy
             if not raw_payload.get("fecha_ingreso"):
                 raw_payload["fecha_ingreso"] = date.today().isoformat()
 
-            # Forzamos: codigo siempre vacío => se genera
-            raw_payload["codigo"] = ""
+            # Normalizaciones útiles para que no truene por formato del Excel
+            raw_payload["rfc"] = _norm_rfc(raw_payload.get("rfc"))
+            raw_payload["no_imss"] = _norm_imss(raw_payload.get("no_imss"))
 
-            # Normaliza/valida usando TU sanitizer actual
+            # CODIGO:
+            # - si viene en Excel, lo respetamos y normalizamos a formato A006
+            # - si NO viene, lo dejamos vacío para generarlo después
+            try:
+                excel_codigo = normalize_codigo_from_excel(
+                    codigo=raw_payload.get("codigo"),
+                    nombre=raw_payload.get("nombre"),
+                )
+            except ApiError as e:
+                errors.append(RowError(row_number=row_number, message=str(e), data=raw_payload))
+                continue
+
+            raw_payload["codigo"] = excel_codigo  # puede ser "" si no venía
+
+            # Sanitiza/valida
             try:
                 data = sanitize_operator_payload(raw_payload, partial=False)
             except ApiError as e:
                 errors.append(RowError(row_number=row_number, message=str(e), data=raw_payload))
                 continue
 
-            # Asignar client_id
             data["client_id"] = client_id
 
-            # Generar código según primer apellido
-            data["codigo"] = code_gen(full_name=data["nombre"])
+            # Si no venía código en Excel, lo generamos (llenando huecos)
+            if not data.get("codigo"):
+                data["codigo"] = code_gen(full_name=data["nombre"])
 
             if dry_run:
                 preview.append(
@@ -112,32 +136,47 @@ def import_operators_from_excel(
                 )
                 continue
 
+            # UPSERT POR CODIGO (principal):
+            existing_by_code = (
+                Operator.query.filter_by(client_id=client_id, codigo=data["codigo"])
+                .limit(1)
+                .first()
+            )
+            if existing_by_code:
+                # Actualiza todo excepto id/client_id/codigo
+                for k, v in data.items():
+                    if k in ("id", "client_id", "codigo"):
+                        continue
+                    setattr(existing_by_code, k, v)
+                updated += 1
+                continue
+
+            # Fallback opcional: UPSERT por nombre (solo si el usuario lo pidió)
             if upsert_by_name:
-                existing = (
+                existing_by_name = (
                     Operator.query.filter_by(client_id=client_id, nombre=data["nombre"])
                     .limit(1)
                     .first()
                 )
-                if existing:
-                    # No tocamos codigo existente en upsert
+                if existing_by_name:
                     for k, v in data.items():
                         if k in ("id", "client_id", "codigo"):
                             continue
-                        setattr(existing, k, v)
+                        setattr(existing_by_name, k, v)
                     updated += 1
                     continue
 
+            # Crear nuevo
             op = Operator(**data)
             db.session.add(op)
             created += 1
 
         if dry_run:
-            # No escribimos en DB
             db.session.rollback()
         else:
             db.session.commit()
 
-    except IntegrityError as e:
+    except IntegrityError:
         db.session.rollback()
         raise ApiError(
             "Error de integridad al importar (posible código duplicado u otro constraint). "
@@ -159,8 +198,6 @@ def import_operators_from_excel(
         "updated": updated,
         "skipped": skipped,
         "errors_count": len(errors),
-        "errors": [
-            {"row": er.row_number, "message": er.message, "data": er.data} for er in errors
-        ],
+        "errors": [{"row": er.row_number, "message": er.message, "data": er.data} for er in errors],
         "preview": preview if dry_run else [],
     }

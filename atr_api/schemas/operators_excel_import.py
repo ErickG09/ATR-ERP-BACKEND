@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime
-from typing import Any, Dict, List, Tuple, Callable
+from typing import Any, Dict, List, Callable
 
 from werkzeug.datastructures import FileStorage
 
@@ -10,7 +10,6 @@ from atr_api.errors import ApiError
 from atr_api.models import Operator
 from atr_api.extensions import db
 
-# Requiere openpyxl
 from openpyxl import load_workbook
 from openpyxl.utils.datetime import from_excel
 
@@ -20,15 +19,21 @@ from openpyxl.utils.datetime import from_excel
 # -----------------------------
 # Mapeo: "Encabezado en Excel" -> "campo backend"
 HEADER_ALIASES: Dict[str, str] = {
-    # obligatorios / base
+    # identificadores
+    "codigo": "codigo",
+    "código": "codigo",
+
+    # base
     "nombre": "nombre",
     "fecha ingreso": "fecha_ingreso",
 
     # sueldos/viaticos
     "sueldo op1": "sueldo_op_1",
     "viaticos op1": "viaticos_op_1",
+    "viáticos op1": "viaticos_op_1",
     "sueldo op2": "sueldo_op_2",
     "viaticos op2": "viaticos_op_2",
+    "viáticos op2": "viaticos_op_2",
 
     # contacto / ids
     "domicilio": "domicilio",
@@ -43,21 +48,30 @@ HEADER_ALIASES: Dict[str, str] = {
     "vencimiento licencia": "fecha_venc_licencia",
 
     "telefono": "telefono",
+    "teléfono": "telefono",
+
     "rfc": "rfc",
+
     "email": "correo_electronico",
     "correo": "correo_electronico",
     "correo electronico": "correo_electronico",
+    "correo electrónico": "correo_electronico",
 
     "gafete aduana": "gafete_aduana",
     "gafete": "gafete_aduana",
+    "gafete aduána": "gafete_aduana",
 
     "apto medico": "apto_medico_licencia",
     "apto médico": "apto_medico_licencia",
 
     "seguro": "tiene_seguro",
+
+    # NUEVO: Tipo carro
+    "tipo carro": "tipo_carro",
+    "tipo de carro": "tipo_carro",
+    "tipo unidad": "tipo_carro",
 }
 
-# Los que vamos a producir como payload para sanitize_operator_payload
 SUPPORTED_FIELDS = set(HEADER_ALIASES.values())
 
 
@@ -78,6 +92,9 @@ def normalize_full_name(value: Any) -> str:
 
 
 def _parse_bool_si_no(value: Any) -> bool:
+    """
+    Vacio => False (esto es importante porque en muchos Excels viene en blanco).
+    """
     if value is None:
         return False
     if isinstance(value, bool):
@@ -87,7 +104,6 @@ def _parse_bool_si_no(value: Any) -> bool:
         return True
     if s in ("0", "false", "f", "no", "n", ""):
         return False
-    # Si meten algo raro, mejor error
     raise ApiError("El campo 'Seguro' debe ser SI/NO (o true/false, 1/0).", 400)
 
 
@@ -107,7 +123,6 @@ def _parse_date_flexible(value: Any) -> str | None:
     if isinstance(value, date):
         return value.isoformat()
 
-    # Excel serial number
     if isinstance(value, (int, float)):
         try:
             d = from_excel(value)
@@ -116,7 +131,6 @@ def _parse_date_flexible(value: Any) -> str | None:
             if isinstance(d, date):
                 return d.isoformat()
         except Exception:
-            # cae a parse de string
             pass
 
     s = str(value).strip()
@@ -144,10 +158,6 @@ def _parse_date_flexible(value: Any) -> str | None:
 
 
 def _parse_numeric_or_blank(value: Any) -> Any:
-    """
-    Dejamos que sanitize_operator_payload convierta a Decimal.
-    Aquí solo normalizamos vacíos.
-    """
     if value is None:
         return ""
     if isinstance(value, str) and not value.strip():
@@ -160,23 +170,19 @@ def parse_excel_operators(file_storage: FileStorage) -> List[Dict[str, Any]]:
     Lee el Excel y regresa una lista:
       [{ "_row_number": 2, "payload": {...}}, ...]
     """
-    # openpyxl necesita bytes -> FileStorage stream
     try:
-        wb = load_workbook(file_storage, data_only=True)
+        # MUY importante para evitar lecturas parciales en algunos entornos
+        file_storage.stream.seek(0)
+        wb = load_workbook(file_storage.stream, data_only=True)
     except Exception as e:
         raise ApiError(f"Excel inválido o corrupto: {e}", 400)
 
     ws = wb.active
 
-    # Encabezados = fila 1
-    headers = []
-    for cell in ws[1]:
-        headers.append(_norm_header(cell.value))
-
+    headers: List[str] = [_norm_header(c.value) for c in ws[1]]
     if not any(headers):
         raise ApiError("No se detectaron encabezados en la fila 1.", 400)
 
-    # Mapear columnas a campos backend
     col_to_field: Dict[int, str] = {}
     for idx, h in enumerate(headers):
         if not h:
@@ -189,12 +195,10 @@ def parse_excel_operators(file_storage: FileStorage) -> List[Dict[str, Any]]:
 
     rows_out: List[Dict[str, Any]] = []
 
-    # Datos desde fila 2
     for row_idx in range(2, ws.max_row + 1):
         row = ws[row_idx]
         payload: Dict[str, Any] = {}
 
-        # Construir payload desde columnas reconocidas
         for col_idx, field in col_to_field.items():
             value = row[col_idx].value if col_idx < len(row) else None
 
@@ -207,83 +211,116 @@ def parse_excel_operators(file_storage: FileStorage) -> List[Dict[str, Any]]:
             else:
                 payload[field] = "" if value is None else str(value).strip()
 
-        # Saltar filas totalmente vacías (sin nombre)
+        # Saltar filas sin nombre
         if not normalize_full_name(payload.get("nombre", "")):
             continue
 
-        # Importante: codigo NO viene del Excel (lo forzamos vacío)
-        payload["codigo"] = ""
-
-        rows_out.append(
-            {
-                "_row_number": row_idx,
-                "payload": payload,
-            }
-        )
+        rows_out.append({"_row_number": row_idx, "payload": payload})
 
     return rows_out
 
 
-# -----------------------------
-# Generación de código (R001…)
-# -----------------------------
-def _extract_first_surname(full_name: str) -> str:
-    parts = normalize_full_name(full_name).split(" ")
-    return parts[0] if parts else ""
+# -----------------------------------------------------------------------------
+# Generación de código por cliente, usando HUECOS (A001..A005, saltar A006, etc.)
+# -----------------------------------------------------------------------------
+_CODE_RE = re.compile(r"^([A-Z])(\d+)$")
 
 
 def _clean_initial(letter: str) -> str:
     letter = (letter or "").strip().upper()
-    # Si no hay letra, usamos 'X'
     return letter[0] if letter else "X"
+
+
+def _extract_prefix_from_name(full_name: str) -> str:
+    # Tu dato viene "APELLIDO NOMBRE" (mayúsculas). Tomamos la inicial del primer token.
+    parts = normalize_full_name(full_name).split(" ")
+    first = parts[0] if parts else ""
+    return _clean_initial(first[:1])
+
+
+def _normalize_codigo(raw: Any) -> str:
+    if raw is None:
+        return ""
+    s = str(raw).strip().upper()
+    s = re.sub(r"\s+", "", s)
+    return s
 
 
 def make_operator_code_generator(*, client_id: int) -> Callable[[str], str]:
     """
-    Regresa una función que genera códigos únicos por cliente:
-      inicial + 3 dígitos (R001, R002...)
-    Se apoya en DB para conocer el máximo existente por inicial
-    y mantiene contador en memoria para múltiples filas del mismo Excel.
+    Genera códigos por cliente llenando huecos.
+    Ej: si existen A006 y A010, el siguiente para prefijo A será A001, A002... A005, A007...
+    Mantiene estado en memoria por prefijo para múltiples inserciones durante el import.
     """
-    cache_next_number: Dict[str, int] = {}
+    cache_used: Dict[str, set[int]] = {}
+    cache_next_candidate: Dict[str, int] = {}
 
-    def get_next_number_for_prefix(prefix: str) -> int:
-        if prefix in cache_next_number:
-            n = cache_next_number[prefix]
-            cache_next_number[prefix] = n + 1
-            return n
+    def _load_used(prefix: str) -> set[int]:
+        if prefix in cache_used:
+            return cache_used[prefix]
 
-        # Buscar máximo existente en DB para ese prefijo
-        # Formato esperado: "R001"
         like = f"{prefix}%"
-        existing_codes = (
+        existing = (
             db.session.query(Operator.codigo)
             .filter(Operator.client_id == client_id)
             .filter(Operator.codigo.ilike(like))
             .all()
         )
 
-        max_n = 0
-        for (code,) in existing_codes:
+        used: set[int] = set()
+        for (code,) in existing:
             if not code:
                 continue
-            m = re.match(r"^[A-Z](\d+)$", str(code).strip().upper())
+            m = _CODE_RE.match(str(code).strip().upper())
             if not m:
                 continue
             try:
-                num = int(m.group(1))
-                max_n = max(max_n, num)
+                used.add(int(m.group(2)))
             except Exception:
                 continue
 
-        next_n = max_n + 1
-        cache_next_number[prefix] = next_n + 1  # guardamos el siguiente después de usarlo
-        return next_n
+        cache_used[prefix] = used
+        cache_next_candidate[prefix] = 1
+        return used
+
+    def _next_available(prefix: str) -> int:
+        used = _load_used(prefix)
+        n = cache_next_candidate.get(prefix, 1)
+
+        # avanzar hasta encontrar hueco
+        while n in used:
+            n += 1
+
+        # reservarlo para esta sesión (import / alta manual)
+        used.add(n)
+        cache_next_candidate[prefix] = n + 1
+        return n
 
     def generator(*, full_name: str) -> str:
-        surname = _extract_first_surname(full_name)
-        prefix = _clean_initial(surname[:1])
-        n = get_next_number_for_prefix(prefix)
+        prefix = _extract_prefix_from_name(full_name)
+        n = _next_available(prefix)
         return f"{prefix}{n:03d}"
 
     return generator
+
+
+def normalize_codigo_from_excel(*, codigo: Any, nombre: Any) -> str:
+    """
+    Si viene código del Excel, lo respetamos.
+    Si NO viene, generaremos a partir del nombre (en el service).
+    """
+    c = _normalize_codigo(codigo)
+    if not c:
+        return ""
+    # validación suave: letra + dígitos
+    m = _CODE_RE.match(c)
+    if not m:
+        # si viene algo raro, preferimos error claro
+        raise ApiError(
+            f"Código inválido '{c}'. Debe tener formato como A006 (letra + número).",
+            400,
+        )
+    # normaliza dígitos a 3 (A6 -> A006)
+    prefix = m.group(1)
+    num = int(m.group(2))
+    return f"{prefix}{num:03d}"

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+
 from flask import Blueprint, jsonify, request
 
 from atr_api.extensions import db
@@ -18,7 +19,7 @@ bp = Blueprint(
     url_prefix="/api/clients/<int:client_id>/deducciones",
 )
 
-# Keys "preset" que existen en tu liquidaciones.py (menos impuestos que es automático)
+# Keys "preset" (menos impuestos que es automático en liquidación)
 PRESET_KEYS = (
     "ayuda_escolar",
     "infonavit",
@@ -53,19 +54,40 @@ def _validate_client(client_id: int) -> Client:
     return c
 
 
-def _get_operator_for_client(client_id: int, operator_id: int) -> Operator:
+def _get_operator_global(operator_id: int) -> Operator:
+    """
+    CORREGIDO:
+    Operadores se tratan como globales (solo existencia).
+    Si tu modelo Operator todavía tiene client_id, se valida contra client_id
+    en los endpoints que lo requieran.
+    """
     op = db.session.get(Operator, operator_id)
-    if not op or int(op.client_id) != int(client_id):
-        raise ApiError("Operador inválido para este cliente.", status_code=400)
+    if not op:
+        raise ApiError("Operador inválido.", status_code=400)
+    return op
+
+
+def _get_operator_for_client_if_available(client_id: int, operator_id: int) -> Operator:
+    """
+    Compatibilidad:
+    - Si Operator tiene atributo client_id, validamos pertenencia.
+    - Si NO lo tiene (operadores globales), solo validamos existencia.
+    """
+    op = _get_operator_global(operator_id)
+
+    # Si existe client_id en el modelo, validamos
+    if hasattr(op, "client_id"):
+        if op.client_id is None or int(op.client_id) != int(client_id):
+            raise ApiError("Operador inválido para este cliente.", status_code=400)
+
     return op
 
 
 def _default_config_payload():
-    # forma compatible con tu store: { global, global_extras, per_operator, updated_at }
     return {
         "global": {
             "ayuda_escolar": "0",
-            "impuestos": "0",  # UI puede mostrarlo, pero NO se usa (en liq es auto 6%)
+            "impuestos": "0",  # UI puede mostrarlo, pero NO se usa como config real de liq (en liq es auto 6%)
             "infonavit": "0",
             "sindicato": "0",
             "imss": "0",
@@ -83,7 +105,11 @@ def _serialize_config(row: ClientDeduccionesConfig):
         "global": row.global_json or {},
         "global_extras": row.global_extras_json or [],
         "per_operator": row.per_operator_json or {},
-        "updated_at": row.updated_at.isoformat() if row.updated_at else (row.created_at.isoformat() if row.created_at else None),
+        "updated_at": (
+            row.updated_at.isoformat()
+            if row.updated_at
+            else (row.created_at.isoformat() if row.created_at else None)
+        ),
     }
 
 
@@ -105,8 +131,12 @@ def _sync_ayuda_escolar_to_operators(client_id: int, payload: dict):
     """
     REGLA:
     - Si per_operator[opId].enabled y trae values.ayuda_escolar => ese manda para ese operador.
-    - Si no hay override, usa global.ayuda_escolar para ese operador.
-    Solo actualizamos operadores del client_id actual.
+    - Si no hay override, usa global.ayuda_escolar.
+
+    IMPORTANTE:
+    - Si tu tabla Operator todavía está segmentada por client_id, se actualizarán SOLO los del cliente.
+    - Si Operator es global (sin client_id), por seguridad SOLO se actualizan los operadores que
+      estén presentes en per_operator (y opcionalmente no se fuerza a todos).
     """
     global_obj = payload.get("global") or {}
     per_op = payload.get("per_operator") or {}
@@ -115,12 +145,40 @@ def _sync_ayuda_escolar_to_operators(client_id: int, payload: dict):
     if g_help is None:
         g_help = 0.0
 
-    # carga operadores del cliente
-    ops = Operator.query.filter_by(client_id=client_id).all()
+    # Caso A: Operator tiene client_id => actualizamos todos los operadores del cliente
+    try:
+        if hasattr(Operator, "client_id"):
+            ops = Operator.query.filter_by(client_id=client_id).all()
+            for op in ops:
+                key = str(op.id)
+                entry = per_op.get(key) or {}
+                enabled = bool(entry.get("enabled") is True)
+                values = entry.get("values") or {}
 
-    for op in ops:
-        key = str(op.id)
-        entry = per_op.get(key) or {}
+                if enabled and ("ayuda_escolar" in values):
+                    v = _num(values.get("ayuda_escolar"), g_help)
+                    if v is None:
+                        v = g_help
+                    op.ayuda_escolar = round(float(v), 2)
+                else:
+                    op.ayuda_escolar = round(float(g_help), 2)
+            return
+    except Exception:
+        # si algo raro pasa, caemos a estrategia B
+        pass
+
+    # Caso B: Operator global => actualizamos SOLO los operadores referenciados en per_operator
+    for op_id_str, entry in (per_op or {}).items():
+        try:
+            op_id = int(op_id_str)
+        except Exception:
+            continue
+
+        op = db.session.get(Operator, op_id)
+        if not op:
+            continue
+
+        entry = entry or {}
         enabled = bool(entry.get("enabled") is True)
         values = entry.get("values") or {}
 
@@ -130,17 +188,18 @@ def _sync_ayuda_escolar_to_operators(client_id: int, payload: dict):
                 v = g_help
             op.ayuda_escolar = round(float(v), 2)
         else:
-            # usa global
-            op.ayuda_escolar = round(float(g_help), 2)
+            # si no hay override, NO forzamos global en operador global (evita pisar)
+            # Si quieres forzarlo, cambia a: op.ayuda_escolar = round(float(g_help), 2)
+            pass
 
 
 def _validate_config_payload(body: dict) -> dict:
     """
-    Validación mínima para no romper tu UI:
+    Validación mínima:
     - global: dict
     - per_operator: dict
     - global_extras: list
-    Además normalizamos montos a string (para que tu UI los mantenga como texto).
+    Normalizamos montos a string (para que UI los mantenga como texto).
     """
     if not isinstance(body, dict):
         raise ApiError("Cuerpo JSON inválido.", status_code=400)
@@ -156,21 +215,22 @@ def _validate_config_payload(body: dict) -> dict:
     if not isinstance(global_extras, list):
         raise ApiError("'global_extras' debe ser lista.", status_code=400)
 
-    # normaliza keys conocidas a string num (sin forzar, pero asegura que existan si quieres)
     def _as_money_string(v):
         if v is None:
             return "0"
         s = str(v).strip()
         return s if s != "" else "0"
 
+    # global: normaliza a strings
     for k in list(global_obj.keys()):
-        # permitimos que UI mande "impuestos" pero backend no lo usa como config real
         global_obj[k] = _as_money_string(global_obj.get(k))
 
     # per_operator: { "123": { enabled: bool, values: {..}, extras:[..] } }
+    cleaned_per_operator: dict = {}
     for op_id, entry in per_operator.items():
         if not isinstance(entry, dict):
             raise ApiError("per_operator tiene una entrada inválida.", status_code=400)
+
         enabled = bool(entry.get("enabled") is True)
         values = entry.get("values") or {}
         extras = entry.get("extras") or []
@@ -184,13 +244,13 @@ def _validate_config_payload(body: dict) -> dict:
         for k2 in list(values.keys()):
             values[k2] = _as_money_string(values.get(k2))
 
-        per_operator[str(op_id)] = {
+        cleaned_per_operator[str(op_id)] = {
             "enabled": enabled,
             "values": values,
             "extras": extras,
         }
 
-    # extras globales: solo validamos forma ligera
+    # extras globales: validación ligera
     cleaned_global_extras = []
     for ex in global_extras:
         if not isinstance(ex, dict):
@@ -202,15 +262,17 @@ def _validate_config_payload(body: dict) -> dict:
 
         if not ex_id or not label:
             continue
+
         cleaned_global_extras.append(
             {"id": ex_id, "label": label, "monto": monto, "enabled": enabled}
         )
 
     return {
         "global": global_obj,
-        "per_operator": per_operator,
+        "per_operator": cleaned_per_operator,
         "global_extras": cleaned_global_extras,
     }
+
 
 # ---------------- endpoints: CONFIG ----------------
 
@@ -246,7 +308,7 @@ def put_config(client_id: int):
         row.global_extras_json = payload["global_extras"]
         row.updated_at = datetime.utcnow()
 
-        # ✅ requisito tuyo: ayuda_escolar se refleja en tabla operators
+        # requisito: ayuda_escolar se refleja en tabla operators
         _sync_ayuda_escolar_to_operators(client_id, payload)
 
         db.session.commit()
@@ -258,16 +320,20 @@ def put_config(client_id: int):
         db.session.rollback()
         return _err(f"No se pudo guardar config. {str(e)}", 400)
 
+
 # ---------------- endpoints: EXTRAS "DEUDA" POR OPERADOR ----------------
 
 @bp.get("/operators/<int:operator_id>/extras")
 def list_operator_extras(client_id: int, operator_id: int):
     try:
         _validate_client(client_id)
-        _get_operator_for_client(client_id, operator_id)
+        _get_operator_for_client_if_available(client_id, operator_id)
 
         activo = request.args.get("activo")
-        q = OperatorDeduccionExtra.query.filter_by(client_id=client_id, operator_id=operator_id)
+        q = OperatorDeduccionExtra.query.filter_by(
+            client_id=client_id,
+            operator_id=operator_id,
+        )
 
         if activo is not None:
             s = str(activo).strip().lower()
@@ -288,7 +354,7 @@ def list_operator_extras(client_id: int, operator_id: int):
 def create_operator_extra(client_id: int, operator_id: int):
     try:
         _validate_client(client_id)
-        _get_operator_for_client(client_id, operator_id)
+        _get_operator_for_client_if_available(client_id, operator_id)
 
         body = request.get_json(silent=True) or {}
         label = str(body.get("label") or "").strip()
@@ -303,7 +369,6 @@ def create_operator_extra(client_id: int, operator_id: int):
         if monto < 0:
             raise ApiError("monto no puede ser negativo.", status_code=400)
 
-        # saldo_restante opcional, si no viene = monto
         saldo_restante = _num(body.get("saldo_restante"), monto)
         if saldo_restante is None:
             saldo_restante = monto
@@ -335,10 +400,12 @@ def create_operator_extra(client_id: int, operator_id: int):
 def update_operator_extra(client_id: int, operator_id: int, extra_id: int):
     try:
         _validate_client(client_id)
-        _get_operator_for_client(client_id, operator_id)
+        _get_operator_for_client_if_available(client_id, operator_id)
 
         x = OperatorDeduccionExtra.query.filter_by(
-            id=extra_id, client_id=client_id, operator_id=operator_id
+            id=extra_id,
+            client_id=client_id,
+            operator_id=operator_id,
         ).one_or_none()
         if not x:
             raise ApiError("Extra no encontrada.", status_code=404)
@@ -380,10 +447,12 @@ def update_operator_extra(client_id: int, operator_id: int, extra_id: int):
 def delete_operator_extra(client_id: int, operator_id: int, extra_id: int):
     try:
         _validate_client(client_id)
-        _get_operator_for_client(client_id, operator_id)
+        _get_operator_for_client_if_available(client_id, operator_id)
 
         x = OperatorDeduccionExtra.query.filter_by(
-            id=extra_id, client_id=client_id, operator_id=operator_id
+            id=extra_id,
+            client_id=client_id,
+            operator_id=operator_id,
         ).one_or_none()
         if not x:
             raise ApiError("Extra no encontrada.", status_code=404)

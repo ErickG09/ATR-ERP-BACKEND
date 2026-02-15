@@ -1,3 +1,5 @@
+# atr_api/models/__init__.py
+
 from atr_api.extensions import db
 
 from .client import Client
@@ -14,6 +16,9 @@ from .liquidacion import Liquidacion
 from .deducciones_config import ClientDeduccionesConfig
 from .operator_deduccion_extra import OperatorDeduccionExtra
 
+from .talon_series_counter import TalonSeriesCounter
+from .talon_series import TalonSeries
+
 __all__ = [
     "db",
     "Client",
@@ -25,8 +30,8 @@ __all__ = [
     "Guide",
     "ClientCounter",
     "Liquidacion",
-
-    # ✅ NUEVO
     "ClientDeduccionesConfig",
     "OperatorDeduccionExtra",
+    "TalonSeriesCounter",   
+    "TalonSeries"
 ]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+
 from atr_api.extensions import db
 
 
@@ -9,8 +10,8 @@ class OperatorDeduccionExtra(db.Model):
     """
     Deducción extra tipo "deuda" por operador:
     - saldo_original: monto inicial
-    - saldo_restante: se va reduciendo conforme el contador aplica descuentos en liquidaciones
-    En cuanto llega a 0 -> se puede marcar activo = False.
+    - saldo_restante: se va reduciendo conforme se aplica en liquidaciones
+    Al llegar a 0 -> se marca activo=False (lógica en routes/liquidaciones).
     """
     __tablename__ = "operator_deducciones_extras"
 
@@ -32,13 +33,14 @@ class OperatorDeduccionExtra(db.Model):
 
     label = db.Column(db.String(140), nullable=False)
 
+    # Numeric con defaults para Postgres
     saldo_original = db.Column(db.Numeric(14, 2), nullable=False, server_default="0")
     saldo_restante = db.Column(db.Numeric(14, 2), nullable=False, server_default="0")
 
     activo = db.Column(db.Boolean, nullable=False, server_default="true")
 
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, nullable=True, onupdate=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=True, default=None, onupdate=datetime.utcnow)
 
     __table_args__ = (
         db.Index("ix_op_extra_client_operator", "client_id", "operator_id"),
@@ -46,4 +48,7 @@ class OperatorDeduccionExtra(db.Model):
     )
 
     def __repr__(self) -> str:
-        return f"<OperatorDeduccionExtra id={self.id} operator_id={self.operator_id} saldo_restante={self.saldo_restante}>"
+        return (
+            f"<OperatorDeduccionExtra id={self.id} "
+            f"operator_id={self.operator_id} saldo_restante={self.saldo_restante}>"
+        )
