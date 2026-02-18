@@ -32,6 +32,10 @@ class Liquidacion(db.Model):
 
     fecha = db.Column(db.Date, nullable=False, default=date.today)
 
+    # Fecha usada para determinar qué mes/año IMSS aplicar
+    imss_fecha = db.Column(db.Date, nullable=True)
+
+
     # Operadores
     operator_id = db.Column(db.Integer, db.ForeignKey("operators.id"), nullable=False)
     operator2_id = db.Column(db.Integer, db.ForeignKey("operators.id"), nullable=True)
@@ -68,6 +72,7 @@ class Liquidacion(db.Model):
     viaticos_base_op2 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
     # “maniobra y todo eso” (por operador, editable por liquidación)
+    # (Nos quedamos con estos y eliminamos gasto_maniobras_1ro/_2do)
     maniobra_op1 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     maniobra_op2 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
@@ -81,8 +86,6 @@ class Liquidacion(db.Model):
     gasto_rep_menores = db.Column(db.Numeric(14, 2), nullable=True, default=0)
     gasto_otros_c_comp = db.Column(db.Numeric(14, 2), nullable=True, default=0)
     gasto_ayudas = db.Column(db.Numeric(14, 2), nullable=True, default=0)
-    gasto_maniobras_1ro = db.Column(db.Numeric(14, 2), nullable=True, default=0)
-    gasto_maniobras_2do = db.Column(db.Numeric(14, 2), nullable=True, default=0)
 
     # Gastos de viaje (catálogo)
     gasto_dias_taller = db.Column(db.Numeric(14, 2), nullable=True, default=0)
@@ -210,15 +213,6 @@ class Liquidacion(db.Model):
     )
 
     def calc_gastos_iva(self) -> dict:
-        """
-        Calcula (sin persistir) el iva_monto y total_con_iva por cada gasto con IVA.
-        Regresa:
-          {
-            "items": { "gasto_aceites": {"base":x,"iva_pct":p,"iva_monto":y,"total":t}, ... },
-            "iva_total": ...,
-            "total_con_iva": ...,
-          }
-        """
         items = {}
         iva_total = 0.0
         total_con_iva = 0.0

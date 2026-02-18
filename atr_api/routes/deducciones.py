@@ -1,4 +1,3 @@
-# atr_api/routes/deducciones.py
 from __future__ import annotations
 
 from datetime import datetime
@@ -19,12 +18,11 @@ bp = Blueprint(
     url_prefix="/api/clients/<int:client_id>/deducciones",
 )
 
-# Keys "preset" (menos impuestos que es automático en liquidación)
+# Keys preset configurables (IMSS eliminado — ahora viene de tabla mensual)
 PRESET_KEYS = (
     "ayuda_escolar",
     "infonavit",
     "sindicato",
-    "imss",
     "fonacot",
     "pension_alimenticia",
 )
@@ -55,12 +53,6 @@ def _validate_client(client_id: int) -> Client:
 
 
 def _get_operator_global(operator_id: int) -> Operator:
-    """
-    CORREGIDO:
-    Operadores se tratan como globales (solo existencia).
-    Si tu modelo Operator todavía tiene client_id, se valida contra client_id
-    en los endpoints que lo requieran.
-    """
     op = db.session.get(Operator, operator_id)
     if not op:
         raise ApiError("Operador inválido.", status_code=400)
@@ -68,14 +60,8 @@ def _get_operator_global(operator_id: int) -> Operator:
 
 
 def _get_operator_for_client_if_available(client_id: int, operator_id: int) -> Operator:
-    """
-    Compatibilidad:
-    - Si Operator tiene atributo client_id, validamos pertenencia.
-    - Si NO lo tiene (operadores globales), solo validamos existencia.
-    """
     op = _get_operator_global(operator_id)
 
-    # Si existe client_id en el modelo, validamos
     if hasattr(op, "client_id"):
         if op.client_id is None or int(op.client_id) != int(client_id):
             raise ApiError("Operador inválido para este cliente.", status_code=400)
@@ -87,10 +73,9 @@ def _default_config_payload():
     return {
         "global": {
             "ayuda_escolar": "0",
-            "impuestos": "0",  # UI puede mostrarlo, pero NO se usa como config real de liq (en liq es auto 6%)
+            "impuestos": "0",  # informativo en UI (liquidación lo calcula automático)
             "infonavit": "0",
             "sindicato": "0",
-            "imss": "0",
             "fonacot": "0",
             "pension_alimenticia": "0",
         },
@@ -127,17 +112,10 @@ def _serialize_extra(x: OperatorDeduccionExtra):
     }
 
 
-def _sync_ayuda_escolar_to_operators(client_id: int, payload: dict):
-    """
-    REGLA:
-    - Si per_operator[opId].enabled y trae values.ayuda_escolar => ese manda para ese operador.
-    - Si no hay override, usa global.ayuda_escolar.
+# ---------------- ayuda escolar sync ----------------
 
-    IMPORTANTE:
-    - Si tu tabla Operator todavía está segmentada por client_id, se actualizarán SOLO los del cliente.
-    - Si Operator es global (sin client_id), por seguridad SOLO se actualizan los operadores que
-      estén presentes en per_operator (y opcionalmente no se fuerza a todos).
-    """
+def _sync_ayuda_escolar_to_operators(client_id: int, payload: dict):
+
     global_obj = payload.get("global") or {}
     per_op = payload.get("per_operator") or {}
 
@@ -145,29 +123,22 @@ def _sync_ayuda_escolar_to_operators(client_id: int, payload: dict):
     if g_help is None:
         g_help = 0.0
 
-    # Caso A: Operator tiene client_id => actualizamos todos los operadores del cliente
-    try:
-        if hasattr(Operator, "client_id"):
-            ops = Operator.query.filter_by(client_id=client_id).all()
-            for op in ops:
-                key = str(op.id)
-                entry = per_op.get(key) or {}
-                enabled = bool(entry.get("enabled") is True)
-                values = entry.get("values") or {}
+    if hasattr(Operator, "client_id"):
+        ops = Operator.query.filter_by(client_id=client_id).all()
+        for op in ops:
+            key = str(op.id)
+            entry = per_op.get(key) or {}
+            enabled = bool(entry.get("enabled") is True)
+            values = entry.get("values") or {}
 
-                if enabled and ("ayuda_escolar" in values):
-                    v = _num(values.get("ayuda_escolar"), g_help)
-                    if v is None:
-                        v = g_help
-                    op.ayuda_escolar = round(float(v), 2)
-                else:
-                    op.ayuda_escolar = round(float(g_help), 2)
-            return
-    except Exception:
-        # si algo raro pasa, caemos a estrategia B
-        pass
+            if enabled and ("ayuda_escolar" in values):
+                v = _num(values.get("ayuda_escolar"), g_help)
+                op.ayuda_escolar = round(float(v or g_help), 2)
+            else:
+                op.ayuda_escolar = round(float(g_help), 2)
+        return
 
-    # Caso B: Operator global => actualizamos SOLO los operadores referenciados en per_operator
+    # fallback operadores globales
     for op_id_str, entry in (per_op or {}).items():
         try:
             op_id = int(op_id_str)
@@ -184,23 +155,11 @@ def _sync_ayuda_escolar_to_operators(client_id: int, payload: dict):
 
         if enabled and ("ayuda_escolar" in values):
             v = _num(values.get("ayuda_escolar"), g_help)
-            if v is None:
-                v = g_help
-            op.ayuda_escolar = round(float(v), 2)
-        else:
-            # si no hay override, NO forzamos global en operador global (evita pisar)
-            # Si quieres forzarlo, cambia a: op.ayuda_escolar = round(float(g_help), 2)
-            pass
+            op.ayuda_escolar = round(float(v or g_help), 2)
 
 
 def _validate_config_payload(body: dict) -> dict:
-    """
-    Validación mínima:
-    - global: dict
-    - per_operator: dict
-    - global_extras: list
-    Normalizamos montos a string (para que UI los mantenga como texto).
-    """
+
     if not isinstance(body, dict):
         raise ApiError("Cuerpo JSON inválido.", status_code=400)
 
@@ -221,15 +180,17 @@ def _validate_config_payload(body: dict) -> dict:
         s = str(v).strip()
         return s if s != "" else "0"
 
-    # global: normaliza a strings
+    # Normalizar solo keys válidas
     for k in list(global_obj.keys()):
+        if k not in PRESET_KEYS and k != "impuestos":
+            global_obj.pop(k)
+            continue
         global_obj[k] = _as_money_string(global_obj.get(k))
 
-    # per_operator: { "123": { enabled: bool, values: {..}, extras:[..] } }
     cleaned_per_operator: dict = {}
     for op_id, entry in per_operator.items():
         if not isinstance(entry, dict):
-            raise ApiError("per_operator tiene una entrada inválida.", status_code=400)
+            raise ApiError("per_operator inválido.", status_code=400)
 
         enabled = bool(entry.get("enabled") is True)
         values = entry.get("values") or {}
@@ -240,8 +201,10 @@ def _validate_config_payload(body: dict) -> dict:
         if not isinstance(extras, list):
             raise ApiError("per_operator.extras debe ser lista.", status_code=400)
 
-        # normaliza values a strings
         for k2 in list(values.keys()):
+            if k2 not in PRESET_KEYS:
+                values.pop(k2)
+                continue
             values[k2] = _as_money_string(values.get(k2))
 
         cleaned_per_operator[str(op_id)] = {
@@ -250,15 +213,15 @@ def _validate_config_payload(body: dict) -> dict:
             "extras": extras,
         }
 
-    # extras globales: validación ligera
     cleaned_global_extras = []
     for ex in global_extras:
         if not isinstance(ex, dict):
             continue
+
         ex_id = str(ex.get("id") or "").strip()
         label = str(ex.get("label") or "").strip()
         monto = _as_money_string(ex.get("monto"))
-        enabled = bool(ex.get("enabled") is not False)  # default True
+        enabled = bool(ex.get("enabled") is not False)
 
         if not ex_id or not label:
             continue
@@ -274,7 +237,7 @@ def _validate_config_payload(body: dict) -> dict:
     }
 
 
-# ---------------- endpoints: CONFIG ----------------
+# ---------------- endpoints CONFIG ----------------
 
 @bp.get("/config")
 def get_config(client_id: int):
@@ -308,11 +271,11 @@ def put_config(client_id: int):
         row.global_extras_json = payload["global_extras"]
         row.updated_at = datetime.utcnow()
 
-        # requisito: ayuda_escolar se refleja en tabla operators
         _sync_ayuda_escolar_to_operators(client_id, payload)
 
         db.session.commit()
         return jsonify(_serialize_config(row))
+
     except ApiError as e:
         db.session.rollback()
         return _err(str(e), e.status_code or 400)
@@ -321,7 +284,7 @@ def put_config(client_id: int):
         return _err(f"No se pudo guardar config. {str(e)}", 400)
 
 
-# ---------------- endpoints: EXTRAS "DEUDA" POR OPERADOR ----------------
+# ---------------- endpoints EXTRAS ----------------
 
 @bp.get("/operators/<int:operator_id>/extras")
 def list_operator_extras(client_id: int, operator_id: int):
@@ -344,130 +307,8 @@ def list_operator_extras(client_id: int, operator_id: int):
 
         items = q.order_by(OperatorDeduccionExtra.id.desc()).all()
         return jsonify({"items": [_serialize_extra(x) for x in items]})
+
     except ApiError as e:
         return _err(str(e), e.status_code or 400)
     except Exception as e:
         return _err(f"No se pudieron listar extras. {str(e)}", 400)
-
-
-@bp.post("/operators/<int:operator_id>/extras")
-def create_operator_extra(client_id: int, operator_id: int):
-    try:
-        _validate_client(client_id)
-        _get_operator_for_client_if_available(client_id, operator_id)
-
-        body = request.get_json(silent=True) or {}
-        label = str(body.get("label") or "").strip()
-        if not label:
-            raise ApiError("label es obligatorio.", status_code=400)
-        if len(label) > 140:
-            raise ApiError("label demasiado largo (máx 140).", status_code=400)
-
-        monto = _num(body.get("monto"), None)
-        if monto is None:
-            raise ApiError("monto inválido.", status_code=400)
-        if monto < 0:
-            raise ApiError("monto no puede ser negativo.", status_code=400)
-
-        saldo_restante = _num(body.get("saldo_restante"), monto)
-        if saldo_restante is None:
-            saldo_restante = monto
-        if saldo_restante < 0:
-            raise ApiError("saldo_restante no puede ser negativo.", status_code=400)
-
-        activo = bool(body.get("activo") is not False)
-
-        x = OperatorDeduccionExtra(
-            client_id=client_id,
-            operator_id=operator_id,
-            label=label,
-            saldo_original=round(float(monto), 2),
-            saldo_restante=round(float(saldo_restante), 2),
-            activo=activo,
-        )
-        db.session.add(x)
-        db.session.commit()
-        return jsonify(_serialize_extra(x)), 201
-    except ApiError as e:
-        db.session.rollback()
-        return _err(str(e), e.status_code or 400)
-    except Exception as e:
-        db.session.rollback()
-        return _err(f"No se pudo crear extra. {str(e)}", 400)
-
-
-@bp.patch("/operators/<int:operator_id>/extras/<int:extra_id>")
-def update_operator_extra(client_id: int, operator_id: int, extra_id: int):
-    try:
-        _validate_client(client_id)
-        _get_operator_for_client_if_available(client_id, operator_id)
-
-        x = OperatorDeduccionExtra.query.filter_by(
-            id=extra_id,
-            client_id=client_id,
-            operator_id=operator_id,
-        ).one_or_none()
-        if not x:
-            raise ApiError("Extra no encontrada.", status_code=404)
-
-        body = request.get_json(silent=True) or {}
-
-        if "label" in body:
-            label = str(body.get("label") or "").strip()
-            if not label:
-                raise ApiError("label inválido.", status_code=400)
-            if len(label) > 140:
-                raise ApiError("label demasiado largo (máx 140).", status_code=400)
-            x.label = label
-
-        if "saldo_restante" in body:
-            sr = _num(body.get("saldo_restante"), None)
-            if sr is None:
-                raise ApiError("saldo_restante inválido.", status_code=400)
-            if sr < 0:
-                raise ApiError("saldo_restante no puede ser negativo.", status_code=400)
-            x.saldo_restante = round(float(sr), 2)
-            if float(x.saldo_restante or 0) <= 0:
-                x.activo = False
-
-        if "activo" in body:
-            x.activo = bool(body.get("activo") is True)
-
-        db.session.commit()
-        return jsonify(_serialize_extra(x))
-    except ApiError as e:
-        db.session.rollback()
-        return _err(str(e), e.status_code or 400)
-    except Exception as e:
-        db.session.rollback()
-        return _err(f"No se pudo actualizar extra. {str(e)}", 400)
-
-
-@bp.delete("/operators/<int:operator_id>/extras/<int:extra_id>")
-def delete_operator_extra(client_id: int, operator_id: int, extra_id: int):
-    try:
-        _validate_client(client_id)
-        _get_operator_for_client_if_available(client_id, operator_id)
-
-        x = OperatorDeduccionExtra.query.filter_by(
-            id=extra_id,
-            client_id=client_id,
-            operator_id=operator_id,
-        ).one_or_none()
-        if not x:
-            raise ApiError("Extra no encontrada.", status_code=404)
-
-        hard = str(request.args.get("hard") or "0").strip().lower() in ("1", "true", "t", "yes", "y")
-        if hard:
-            db.session.delete(x)
-        else:
-            x.activo = False
-
-        db.session.commit()
-        return jsonify({"status": "deleted" if hard else "inactive", "id": int(extra_id)})
-    except ApiError as e:
-        db.session.rollback()
-        return _err(str(e), e.status_code or 400)
-    except Exception as e:
-        db.session.rollback()
-        return _err(f"No se pudo eliminar extra. {str(e)}", 400)

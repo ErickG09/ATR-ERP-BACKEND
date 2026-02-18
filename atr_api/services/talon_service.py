@@ -6,6 +6,7 @@ import re
 from typing import Any, Dict, Optional, Tuple
 
 from sqlalchemy import desc
+from sqlalchemy.exc import IntegrityError
 
 from atr_api.extensions import db
 from atr_api.errors import ApiError
@@ -17,8 +18,17 @@ _FOLIO_RE = re.compile(r"^[A-Z0-9]{2,8}$")
 _TALON_RE = re.compile(r"^([A-Z0-9]{2,8})(\d{1,10})$")
 
 
+def _compact_upper(value: Any) -> str:
+    """
+    Normaliza entradas tipo:
+      "nic 00036" -> "NIC00036"
+      " NIC00036 " -> "NIC00036"
+    """
+    return "".join(str(value or "").strip().split()).upper()
+
+
 def normalize_folio(folio: Any) -> str:
-    s = (str(folio or "").strip().upper())
+    s = _compact_upper(folio)
     if not s:
         raise ApiError("folio es obligatorio.", status_code=400)
     if not _FOLIO_RE.match(s):
@@ -43,7 +53,7 @@ def format_talon(folio: str, seq: int, padding: int = 5) -> str:
 
 
 def parse_talon(talon: Any) -> Tuple[str, int]:
-    s = (str(talon or "").strip().upper())
+    s = _compact_upper(talon)
     if not s:
         raise ApiError("talon_interno es obligatorio.", status_code=400)
 
@@ -93,9 +103,13 @@ def require_series(client_id: int, folio: str) -> TalonSeries:
 def _get_or_init_counter_locked(client_id: int, folio: str) -> TalonSeriesCounter:
     """
     Obtiene el contador con lock (FOR UPDATE). Si no existe, lo crea.
+
+    Importante: maneja concurrencia cuando dos requests intentan crear la fila al mismo tiempo.
+    Usamos SAVEPOINT (begin_nested) para no tumbar la transacción completa si hay IntegrityError.
     """
     folio_n = normalize_folio(folio)
 
+    # 1) Intento normal: leer con lock
     row = (
         db.session.query(TalonSeriesCounter)
         .filter(
@@ -108,12 +122,18 @@ def _get_or_init_counter_locked(client_id: int, folio: str) -> TalonSeriesCounte
     if row:
         return row
 
-    # Crear inicial
-    row = TalonSeriesCounter(client_id=int(client_id), folio=folio_n, seq=0)
-    db.session.add(row)
-    db.session.flush()
+    # 2) No existe: intentamos crearla con SAVEPOINT (para tolerar carrera)
+    try:
+        with db.session.begin_nested():
+            db.session.add(
+                TalonSeriesCounter(client_id=int(client_id), folio=folio_n, seq=0)
+            )
+            db.session.flush()
+    except IntegrityError:
+        # Otro request la creó entre nuestro SELECT y el INSERT. Continuamos a releer con lock.
+        pass
 
-    # Releer con lock
+    # 3) Releer con lock (ya debe existir)
     row2 = (
         db.session.query(TalonSeriesCounter)
         .filter(
@@ -121,8 +141,12 @@ def _get_or_init_counter_locked(client_id: int, folio: str) -> TalonSeriesCounte
             TalonSeriesCounter.folio == folio_n,
         )
         .with_for_update()
-        .one()
+        .one_or_none()
     )
+    if not row2:
+        # Esto sería extremadamente raro; dejamos error claro.
+        raise ApiError("No se pudo inicializar el contador de la serie.", status_code=500)
+
     return row2
 
 
@@ -245,7 +269,9 @@ def suggest_talon_payload(
         "last_talon": last_talon,
         "next_seq": int(last_seq + 1),
         "next_talon": next_talon,
-        "prefill_liquidacion_id": int(getattr(last_liq, "id", 0) or 0) if (include_prefill and last_liq) else None,
+        "prefill_liquidacion_id": int(getattr(last_liq, "id", 0) or 0)
+        if (include_prefill and last_liq)
+        else None,
     }
     return payload
 
@@ -273,10 +299,11 @@ def ensure_counter_at_least(client_id: int, folio: str, seq_used: int) -> None:
 def lookup_liquidacion_by_talon(client_id: int, talon: str):
     """
     Busca una liquidación por talon_interno exacto (normalizado).
+    Nota: aquí no aplicamos padding del catálogo; buscamos por el string exacto guardado.
     """
     from atr_api.models.liquidacion import Liquidacion  # local import
 
-    ti = (str(talon or "").strip().upper())
+    ti = _compact_upper(talon)
     if not ti:
         raise ApiError("talon es obligatorio.", status_code=400)
 

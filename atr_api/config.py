@@ -2,7 +2,6 @@
 from pathlib import Path
 import os
 from dotenv import load_dotenv
-
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -30,13 +29,14 @@ def _normalize_db_url(url: str) -> str:
 
 
 class Config:
+    # Importante: en producción SIEMPRE define SECRET_KEY en .env
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
 
     raw_db_url = os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR / 'atr_api.db'}")
     SQLALCHEMY_DATABASE_URI = _normalize_db_url(raw_db_url)
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
-    #  Evita conexiones muertas (SSL closed unexpectedly)
+    # Evita conexiones muertas (SSL closed unexpectedly)
     SQLALCHEMY_ENGINE_OPTIONS = {
         "pool_pre_ping": True,
         "pool_recycle": int(os.getenv("DB_POOL_RECYCLE", "280")),
@@ -52,6 +52,12 @@ class Config:
         CORS_ORIGINS = []
 
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+    # -------------------------
+    # JWT settings (nuevo)
+    # -------------------------
+    JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+    JWT_EXPIRES_SECONDS = int(os.getenv("JWT_EXPIRES_SECONDS", "3600"))  # 1 hora
 
 
 class DevelopmentConfig(Config):

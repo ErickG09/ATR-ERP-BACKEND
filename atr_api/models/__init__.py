@@ -18,6 +18,7 @@ from .operator_deduccion_extra import OperatorDeduccionExtra
 
 from .talon_series_counter import TalonSeriesCounter
 from .talon_series import TalonSeries
+from .operator_imss import OperatorIMSS
 
 __all__ = [
     "db",
@@ -33,5 +34,6 @@ __all__ = [
     "ClientDeduccionesConfig",
     "OperatorDeduccionExtra",
     "TalonSeriesCounter",   
-    "TalonSeries"
+    "TalonSeries",
+    "OperatorIMSS",
 ]

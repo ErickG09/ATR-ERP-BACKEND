@@ -217,3 +217,4 @@ def delete_series(client_id: int, series_id: int):
         return _err(f"No se pudo eliminar. {str(e)}", 400)
 
     return jsonify({"status": "deleted" if hard else "inactive", "id": int(series_id)})
+

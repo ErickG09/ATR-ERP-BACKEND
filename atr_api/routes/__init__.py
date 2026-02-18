@@ -15,6 +15,9 @@ def register_blueprints(app: Flask) -> None:
     from .deducciones import bp as deducciones_bp
 
     from .talon_series import bp as talon_series_bp
+    from .liquidaciones_excel_import import bp as liquidaciones_excel_import_bp
+    from .talon_suggest import bp as talon_suggest_bp
+    from .imss import bp as imss_bp
 
     app.register_blueprint(clients_bp, url_prefix="/api/clients")
 
@@ -25,12 +28,17 @@ def register_blueprints(app: Flask) -> None:
     app.register_blueprint(destinations_bp, url_prefix="/api")
     app.register_blueprint(guides_bp, url_prefix="/api")
 
-    app.register_blueprint(liquidaciones_bp)   # ✅ ya trae /api/clients/... en su blueprint
-    app.register_blueprint(deducciones_bp)     # ✅ ya trae /api/clients/... en su blueprint
+    app.register_blueprint(liquidaciones_bp)   
+    app.register_blueprint(deducciones_bp)     
 
     app.register_blueprint(operators_import_bp, url_prefix="/api")
     app.register_blueprint(cars_import_bp, url_prefix="/api")
     app.register_blueprint(destinations_import_bp, url_prefix="/api")
 
-    app.register_blueprint(talon_series_bp)    # ✅ ya trae /api/clients/... en su blueprint
+    app.register_blueprint(talon_series_bp)    
 
+    app.register_blueprint(liquidaciones_excel_import_bp)    
+
+    app.register_blueprint(talon_suggest_bp)    
+
+    app.register_blueprint(imss_bp, url_prefix="/api")    
