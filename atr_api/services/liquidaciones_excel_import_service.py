@@ -123,13 +123,19 @@ def _group_rows_by_folio(
     errors: List[RowError],
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Agrupa filas por folio detectado desde talon_interno.
+    Agrupa filas por folio detectado desde talon_interno usando el catálogo real
+    (TalonSeries activas del cliente), no parse_talon().
+
     Adjunta en cada fila:
       _folio
       _seq_provided
-      _talon_provided
+      _talon_provided (raw del excel)
+      _talon_normalized (talón con padding correcto)
     """
     grouped: Dict[str, List[Dict[str, Any]]] = {}
+
+    # NUEVO: usar normalización por catálogo
+    from atr_api.services.talon_service import normalize_manual_talon_with_catalog
 
     for item in rows:
         row_number = int(item.get("_row_number") or 0)
@@ -147,7 +153,10 @@ def _group_rows_by_folio(
             continue
 
         try:
-            folio, seq = parse_talon(talon_raw)
+            talon_norm, folio, seq = normalize_manual_talon_with_catalog(
+                client_id=int(client_id),
+                raw_talon=talon_raw,
+            )
         except ApiError as e:
             errors.append(RowError(row_number=row_number, message=str(e), data=payload))
             continue
@@ -155,22 +164,36 @@ def _group_rows_by_folio(
             errors.append(
                 RowError(
                     row_number=row_number,
-                    message="talon_interno inválido (no se pudo parsear).",
+                    message="talon_interno inválido (no se pudo normalizar con catálogo).",
                     data=payload,
                 )
             )
             continue
 
-        folio_n = normalize_folio(folio)
+        if not talon_norm or not folio or not seq:
+            errors.append(
+                RowError(
+                    row_number=row_number,
+                    message="talon_interno inválido (vacío o incompleto).",
+                    data=payload,
+                )
+            )
+            continue
 
+        # Enriquecer payload
         payload["_row_number"] = row_number
         payload["_talon_provided"] = talon_raw.strip().upper()
-        payload["_folio"] = folio_n
+        payload["_talon_normalized"] = talon_norm  # ya con padding correcto
+        payload["_folio"] = folio                  # normalizado
         payload["_seq_provided"] = int(seq)
 
-        grouped.setdefault(folio_n, []).append(payload)
+        # Importante: si quieres que el resto del pipeline use el talón ya normalizado:
+        payload["talon_interno"] = talon_norm
+
+        grouped.setdefault(folio, []).append(payload)
 
     return grouped
+
 
 
 def _assign_expected_seqs_for_folio(
@@ -202,11 +225,14 @@ def _assign_expected_seqs_for_folio(
     for r in rows_for_folio:
         row_number = int(r.get("_row_number") or 0)
         provided_talon = str(r.get("_talon_provided") or "").strip().upper()
+        normalized_talon = str(r.get("_talon_normalized") or provided_talon).strip().upper()
+
         provided_seq = int(r.get("_seq_provided") or 0)
 
         corrected_talon = format_talon(folio, expected, padding)
 
-        was_corrected = (provided_seq != expected) or (provided_talon != corrected_talon)
+        was_corrected = (provided_seq != expected) or (normalized_talon != corrected_talon)
+
 
         if was_corrected:
             corrections.append(

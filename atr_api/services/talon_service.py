@@ -79,6 +79,70 @@ def parse_talon(talon: Any) -> Tuple[str, int]:
 
     return folio, seq
 
+def normalize_manual_talon_with_catalog(
+    *,
+    client_id: int,
+    raw_talon: Any,
+) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """
+    Normaliza un talón usando el catálogo real (TalonSeries activas) del cliente.
+
+    - Detecta la serie por prefijo (elige la MÁS LARGA para evitar conflictos: NI vs NIC).
+    - Extrae la parte numérica y la convierte a int.
+    - Regresa el talón con padding correcto usando format_talon().
+
+    Retorna:
+      (talon_interno_normalizado, talon_folio_normalizado, talon_seq)
+    """
+    s2 = _compact_upper(raw_talon)
+    if not s2:
+        return None, None, None
+
+    # Trae todas las series activas del cliente
+    series_list = (
+        db.session.query(TalonSeries)
+        .filter(
+            TalonSeries.client_id == int(client_id),
+            TalonSeries.activo.is_(True),
+        )
+        .all()
+    )
+    if not series_list:
+        raise ApiError("No hay series de talón activas para este cliente.", status_code=404)
+
+    # Candidatas: las que sean prefijo del talón
+    candidates = []
+    for ser in series_list:
+        fol = _compact_upper(getattr(ser, "folio", ""))
+        if fol and s2.startswith(fol):
+            candidates.append(ser)
+
+    if not candidates:
+        raise ApiError("Serie de talón no registrada para este cliente.", status_code=404)
+
+    # Prefijo más largo gana (evita conflictos)
+    candidates.sort(key=lambda x: len(_compact_upper(getattr(x, "folio", ""))), reverse=True)
+    series = candidates[0]
+
+    folio = normalize_folio(series.folio)
+    tail = s2[len(folio):]  # consecutivo
+
+    if not tail or not tail.isdigit():
+        raise ApiError(
+            "talon_interno inválido. Formato esperado: PREFIJO + NÚMERO (ej. ESP00036).",
+            status_code=400,
+        )
+
+    seq = int(tail)
+    if seq <= 0:
+        raise ApiError("Consecutivo del talón debe ser >= 1.", status_code=400)
+
+    padding = int(series.padding or 5)
+    talon_norm = format_talon(folio, seq, padding)
+
+    return talon_norm, folio, seq
+
+
 
 def get_series(client_id: int, folio: str) -> Optional[TalonSeries]:
     folio_n = normalize_folio(folio)
