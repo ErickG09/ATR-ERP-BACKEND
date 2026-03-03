@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
@@ -19,9 +20,10 @@ from atr_api.errors import ApiError
 # -----------------------------------------------------------------------------
 # Mapeo: "Encabezado en Excel" -> "campo interno"
 #
-# Nota: los nombres pueden variar; aquí soportamos variantes comunes.
-# En el service haremos la validación de negocio (series, consecutivos, etc).
-HEADER_ALIASES: Dict[str, str] = {
+# Nota:
+# - Aquí solo parseamos/normalizamos datos.
+# - La validación de negocio (serie/padding/duplicados por talón, etc.) se hace en el service.
+HEADER_ALIASES_RAW: Dict[str, str] = {
     # Talón / viaje
     "talon": "talon_interno",
     "talón": "talon_interno",
@@ -29,14 +31,22 @@ HEADER_ALIASES: Dict[str, str] = {
     "talón interno": "talon_interno",
     "talon/viaje": "talon_interno",
     "talón/viaje": "talon_interno",
+    "talon viaje": "talon_interno",
+    "talón viaje": "talon_interno",
+    "talon-viaje": "talon_interno",
+    "talón-viaje": "talon_interno",
     "viaje": "talon_interno",
     "no viaje": "talon_interno",
     "n° viaje": "talon_interno",
+    "nº viaje": "talon_interno",
     "num viaje": "talon_interno",
+    "numero viaje": "talon_interno",
+    "n viaje": "talon_interno",
 
     # Factura / Carta Porte
     "factura": "factura_cp",
     "c.p.": "factura_cp",
+    "c.p": "factura_cp",
     "cp": "factura_cp",
     "carta porte": "factura_cp",
     "factura/c.p.": "factura_cp",
@@ -45,6 +55,7 @@ HEADER_ALIASES: Dict[str, str] = {
 
     # Fecha
     "fecha": "fecha",
+    "fecha viaje": "fecha",
 
     # Carro / unidad (camión) / placas (si llegara)
     "carro": "carro",
@@ -89,6 +100,7 @@ HEADER_ALIASES: Dict[str, str] = {
     "primer operador": "operador_1",
 
     "2º operador": "operador_2",
+    "2o operador": "operador_2",
     "2do operador": "operador_2",
     "2 operador": "operador_2",
     "operador 2": "operador_2",
@@ -96,6 +108,7 @@ HEADER_ALIASES: Dict[str, str] = {
 
     # Anticipos / recibos por operador
     "anticipo de gastos 1º": "anticipo_1",
+    "anticipo de gastos 1": "anticipo_1",
     "anticipo gastos 1": "anticipo_1",
     "anticipo 1": "anticipo_1",
     "anticipo operador 1": "anticipo_1",
@@ -106,6 +119,7 @@ HEADER_ALIASES: Dict[str, str] = {
     "folio 1": "recibo_1",
 
     "anticipo de gastos 2º": "anticipo_2",
+    "anticipo de gastos 2": "anticipo_2",
     "anticipo gastos 2": "anticipo_2",
     "anticipo 2": "anticipo_2",
     "anticipo operador 2": "anticipo_2",
@@ -116,26 +130,38 @@ HEADER_ALIASES: Dict[str, str] = {
     "folio 2": "recibo_2",
 }
 
-SUPPORTED_FIELDS = set(HEADER_ALIASES.values())
+SUPPORTED_FIELDS = set(HEADER_ALIASES_RAW.values())
 
 
 # -----------------------------------------------------------------------------
 # Normalización y parseos básicos
 # -----------------------------------------------------------------------------
+def _strip_accents(s: str) -> str:
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch)
+    )
+
+
 def _norm_header(s: Any) -> str:
     """
     Normaliza encabezados para hacer matching robusto:
       - lower
+      - sin acentos
       - espacios colapsados
       - quita saltos de línea
-      - quita puntos finales redundantes (pero conserva 'c.p.' si viene tal cual por alias)
+      - normaliza signos/puntuación comunes (ej. "C.P", "C P", "C.P." => "c p")
     """
     if s is None:
         return ""
     raw = str(s).strip().lower()
     raw = raw.replace("\n", " ").replace("\r", " ")
-    raw = re.sub(r"\s+", " ", raw)
-    raw = raw.strip()
+    raw = _strip_accents(raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+
+    # Normalizar separadores/puntos a espacios para que "c.p.", "c.p", "c p" coincidan
+    raw = raw.replace(".", " ").replace("/", " ").replace("-", " ")
+    raw = re.sub(r"\s+", " ", raw).strip()
+
     return raw
 
 
@@ -203,19 +229,22 @@ def _parse_int(value: Any, *, allow_blank: bool = True) -> Optional[int]:
     if isinstance(value, bool):
         # evita True/False como 1/0
         return None if allow_blank else 0
-    if isinstance(value, (int,)):
+    if isinstance(value, int):
         return int(value)
     if isinstance(value, float):
-        # si viene 10.0 lo aceptamos como 10
         if value.is_integer():
             return int(value)
         return int(round(value))
+
     s = _clean_string(value)
     if not s:
         return None if allow_blank else 0
+
+    # conserva signo si existiera, elimina demás
     s2 = re.sub(r"[^\d\-]+", "", s)
-    if not s2:
+    if not s2 or s2 in ("-",):
         return None if allow_blank else 0
+
     try:
         return int(s2)
     except Exception:
@@ -227,7 +256,7 @@ def _parse_money(value: Any, *, allow_blank: bool = True) -> Optional[float]:
     Parse numérico tolerante:
       - 1,234.56
       - 1234.56
-      - 1234,56  (lo convertimos)
+      - 1234,56
       - vacío => None (si allow_blank)
     """
     if value is None:
@@ -241,25 +270,18 @@ def _parse_money(value: Any, *, allow_blank: bool = True) -> Optional[float]:
     if not s:
         return None if allow_blank else 0.0
 
-    # quitar símbolo moneda y espacios
     s = s.replace("$", "").replace(" ", "")
 
-    # Si tiene ambos separadores, asumimos:
-    # - coma como miles y punto como decimal (1,234.56)
-    # - o punto como miles y coma como decimal (1.234,56)
     if "," in s and "." in s:
-        # Si la última coma está después del último punto -> decimal coma
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "")
             s = s.replace(",", ".")
         else:
             s = s.replace(",", "")
     else:
-        # solo coma -> decimal coma
         if "," in s and "." not in s:
             s = s.replace(",", ".")
 
-    # deja solo dígitos, punto y signo
     s = re.sub(r"[^0-9\.\-]+", "", s)
     if not s or s in ("-", ".", "-."):
         return None if allow_blank else 0.0
@@ -281,6 +303,21 @@ def _normalize_talon(value: Any) -> str:
     return s
 
 
+def _build_header_aliases_normalized() -> Dict[str, str]:
+    """
+    Construye un dict de aliases ya normalizados (con _norm_header) para match robusto.
+    """
+    out: Dict[str, str] = {}
+    for k, v in HEADER_ALIASES_RAW.items():
+        nk = _norm_header(k)
+        if nk:
+            out[nk] = v
+    return out
+
+
+HEADER_ALIASES: Dict[str, str] = _build_header_aliases_normalized()
+
+
 # -----------------------------------------------------------------------------
 # Parser principal
 # -----------------------------------------------------------------------------
@@ -289,24 +326,10 @@ def parse_excel_liquidaciones(file_storage: FileStorage) -> List[Dict[str, Any]]
     Lee el Excel y regresa lista:
       [{ "_row_number": 2, "payload": {...}}, ...]
 
-    Campos internos (payload):
-      - talon_interno (str)
-      - factura_cp (str)
-      - fecha (YYYY-MM-DD o None)
-      - carro (str)
-      - dealer (str)
-      - unidades (int o None)
-      - kms (float o None)
-      - flete (float o None)
-      - iva (float o None)
-      - retencion (float o None)
-      - total (float o None)
-      - operador_1 (str)
-      - anticipo_1 (float o None)
-      - recibo_1 (str)
-      - operador_2 (str)
-      - anticipo_2 (float o None)
-      - recibo_2 (str)
+    Nota importante:
+    - Este parser NO prohíbe talones repetidos. Si el Excel trae varias filas con el
+      mismo talón (mismo viaje con varias cartas porte), se devuelven TAL CUAL.
+      El servicio decide cómo agruparlas (cabecera + detalles).
     """
     try:
         file_storage.stream.seek(0)
@@ -327,12 +350,15 @@ def parse_excel_liquidaciones(file_storage: FileStorage) -> List[Dict[str, Any]]
         if h in HEADER_ALIASES:
             col_to_field[idx] = HEADER_ALIASES[h]
 
-    # Requeridos mínimos para que el import tenga sentido
+    # Requeridos mínimos: talón
     if "talon_interno" not in col_to_field.values():
-        raise ApiError("El Excel debe incluir la columna 'TALON' / 'TALON/VIAJE' / 'Talón interno'.", 400)
-    if "fecha" not in col_to_field.values():
-        raise ApiError("El Excel debe incluir la columna 'FECHA'.", 400)
+        raise ApiError(
+            "El Excel debe incluir la columna 'TALON' / 'TALON/VIAJE' / 'Talón interno'.",
+            400,
+        )
 
+    # Fecha: la soportamos, pero no la hacemos obligatoria aquí.
+    # (El service puede decidir si exige fecha o toma la de la liquidación/cabecera).
     rows_out: List[Dict[str, Any]] = []
 
     for row_idx in range(2, ws.max_row + 1):

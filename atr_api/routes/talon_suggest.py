@@ -60,6 +60,11 @@ def suggest_next_talon(client_id: int):
         next_seq, next_talon,
         prefill_liquidacion_id
       }
+
+    Notas:
+      - El padding lo dicta TalonSeries (catálogo). Ya soporta hasta 12.
+      - Este endpoint NO impone formato ni “corrige” talones manuales; solo sugiere.
+      - NO avanza contador; es solo lectura.
     """
     _, err = _validate_client(client_id)
     if err:

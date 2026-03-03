@@ -14,8 +14,11 @@ from atr_api.models.talon_series import TalonSeries
 from atr_api.models.talon_series_counter import TalonSeriesCounter
 
 
+# Prefijo/folio de serie (catálogo): 2 a 8 caracteres A-Z/0-9 (como ya lo tenías).
 _FOLIO_RE = re.compile(r"^[A-Z0-9]{2,8}$")
-_TALON_RE = re.compile(r"^([A-Z0-9]{2,8})(\d{1,10})$")
+
+# TALÓN: prefijo (2-8) + consecutivo numérico (1-12 dígitos) ✅
+_TALON_RE = re.compile(r"^([A-Z0-9]{2,8})(\d{1,12})$")
 
 
 def _compact_upper(value: Any) -> str:
@@ -37,6 +40,11 @@ def normalize_folio(folio: Any) -> str:
 
 
 def format_talon(folio: str, seq: int, padding: int = 5) -> str:
+    """
+    Formatea un talón con padding (ceros a la izquierda).
+    OJO: Este helper se mantiene para quienes quieran generar talones con padding,
+    pero el flujo "manual" ya NO debe forzar padding al string que el usuario manda.
+    """
     folio_n = normalize_folio(folio)
     try:
         seq_i = int(seq)
@@ -46,13 +54,21 @@ def format_talon(folio: str, seq: int, padding: int = 5) -> str:
         raise ApiError("Consecutivo debe ser >= 1.", status_code=400)
 
     pad = int(padding or 5)
-    if pad < 1 or pad > 10:
+    # ✅ permitir hasta 12 (antes 10)
+    if pad < 1 or pad > 12:
         pad = 5
 
     return f"{folio_n}{seq_i:0{pad}d}"
 
 
 def parse_talon(talon: Any) -> Tuple[str, int]:
+    """
+    Valida formato base y devuelve (folio, seq).
+
+    Importante:
+    - Acepta consecutivo de 1 a 12 dígitos.
+    - No intenta imponer padding; solo valida y parsea.
+    """
     s = _compact_upper(talon)
     if not s:
         raise ApiError("talon_interno es obligatorio.", status_code=400)
@@ -60,7 +76,7 @@ def parse_talon(talon: Any) -> Tuple[str, int]:
     m = _TALON_RE.match(s)
     if not m:
         raise ApiError(
-            "talon_interno inválido. Formato esperado: PREFIJO + NÚMERO (ej. ESP00036).",
+            "talon_interno inválido. Formato esperado: PREFIJO + NÚMERO (ej. ESP36 o ESP00036).",
             status_code=400,
         )
     folio = m.group(1)
@@ -79,6 +95,7 @@ def parse_talon(talon: Any) -> Tuple[str, int]:
 
     return folio, seq
 
+
 def normalize_manual_talon_with_catalog(
     *,
     client_id: int,
@@ -87,9 +104,14 @@ def normalize_manual_talon_with_catalog(
     """
     Normaliza un talón usando el catálogo real (TalonSeries activas) del cliente.
 
-    - Detecta la serie por prefijo (elige la MÁS LARGA para evitar conflictos: NI vs NIC).
-    - Extrae la parte numérica y la convierte a int.
-    - Regresa el talón con padding correcto usando format_talon().
+    Cambio clave (para tu requerimiento):
+    - Ya NO reconstruye el string con padding (no fuerza ceros a la izquierda).
+    - Devuelve el talón "compactado" tal cual lo manda el usuario (sin espacios, uppercase),
+      validando:
+        - que coincida con una serie activa del cliente (prefijo)
+        - que el consecutivo sea numérico
+        - que tenga como máximo 12 dígitos
+    - Aun así devuelve (folio, seq) para control interno/contador.
 
     Retorna:
       (talon_interno_normalizado, talon_folio_normalizado, talon_seq)
@@ -125,23 +147,28 @@ def normalize_manual_talon_with_catalog(
     series = candidates[0]
 
     folio = normalize_folio(series.folio)
-    tail = s2[len(folio):]  # consecutivo
+    tail = s2[len(folio):]  # consecutivo (lo que sobra)
 
     if not tail or not tail.isdigit():
         raise ApiError(
-            "talon_interno inválido. Formato esperado: PREFIJO + NÚMERO (ej. ESP00036).",
+            "talon_interno inválido. Formato esperado: PREFIJO + NÚMERO (ej. ESP36 o ESP00036).",
             status_code=400,
         )
+
+    # ✅ máximo 12 dígitos
+    if len(tail) > 12:
+        raise ApiError("Consecutivo del talón demasiado largo (máx 12 dígitos).", status_code=400)
 
     seq = int(tail)
     if seq <= 0:
         raise ApiError("Consecutivo del talón debe ser >= 1.", status_code=400)
 
-    padding = int(series.padding or 5)
-    talon_norm = format_talon(folio, seq, padding)
+    # NO forzamos padding: talón normalizado = el string compactado original
+    # (pero garantizamos que empiece con el folio normalizado)
+    # Si por alguna razón el folio del input venía en minúsculas o con espacios, s2 ya está OK.
+    talon_norm = f"{folio}{tail}"
 
     return talon_norm, folio, seq
-
 
 
 def get_series(client_id: int, folio: str) -> Optional[TalonSeries]:
@@ -310,6 +337,9 @@ def suggest_talon_payload(
       - last_talon
       - next_talon
       - prefill_liquidacion_id (y opcionalmente el objeto completo lo serializa el route)
+
+    Nota: aquí se mantiene format_talon() porque es para "sugerencias" y puede seguir
+    usando padding configurado en la serie.
     """
     series = require_series(client_id, folio)
     padding = int(series.padding or 5)

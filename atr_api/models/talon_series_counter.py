@@ -13,6 +13,8 @@ class TalonSeriesCounter(db.Model):
     """
     Contador por (client_id, folio) para asignación segura de consecutivo en concurrencia.
     seq guarda el último consecutivo utilizado (ej. 35 => próximo sugerido 36).
+
+    ✅ Ajuste: seq es BIGINT para permitir hasta 12 dígitos (y más si algún día lo necesitas).
     """
 
     __tablename__ = "talon_series_counters"
@@ -30,7 +32,8 @@ class TalonSeriesCounter(db.Model):
     folio = db.Column(db.String(8), nullable=False)
 
     # Último número utilizado (no el siguiente)
-    seq = db.Column(db.Integer, nullable=False, default=0)
+    # ✅ BIGINT para soportar consecutivos grandes
+    seq = db.Column(db.BigInteger, nullable=False, default=0)
 
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)

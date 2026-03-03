@@ -1,4 +1,6 @@
 # atr_api/models/liquidacion.py
+from __future__ import annotations
+
 from datetime import datetime, date
 
 from sqlalchemy import CheckConstraint, Index, UniqueConstraint
@@ -21,20 +23,21 @@ class Liquidacion(db.Model):
     # -------------------------
     # Talón interno (nuevo flujo)
     # -------------------------
-    # Display final (ej. ESP00036)
+    # Display final (ej. ESP00036 / VWP12345678 / VWP36, etc.)
+    # Se recomienda guardar TAL CUAL lo capture el usuario en la lógica de tus endpoints/services.
     talon_interno = db.Column(db.String(64), nullable=True)
 
     # Prefijo/folio del talón (ej. "ESP") para consultas y orden
     talon_folio = db.Column(db.String(8), nullable=True)
 
-    # Consecutivo numérico del talón (ej. 36)
-    talon_seq = db.Column(db.Integer, nullable=True)
+    # Consecutivo numérico del talón (ej. 36, 12345678, 999999999999)
+    # ✅ BIGINT para soportar hasta 12 dígitos
+    talon_seq = db.Column(db.BigInteger, nullable=True)
 
     fecha = db.Column(db.Date, nullable=False, default=date.today)
 
     # Fecha usada para determinar qué mes/año IMSS aplicar
     imss_fecha = db.Column(db.Date, nullable=True)
-
 
     # Operadores
     operator_id = db.Column(db.Integer, db.ForeignKey("operators.id"), nullable=False)
@@ -72,7 +75,6 @@ class Liquidacion(db.Model):
     viaticos_base_op2 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
     # “maniobra y todo eso” (por operador, editable por liquidación)
-    # (Nos quedamos con estos y eliminamos gasto_maniobras_1ro/_2do)
     maniobra_op1 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     maniobra_op2 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
@@ -150,7 +152,19 @@ class Liquidacion(db.Model):
     pagado = db.Column(db.Boolean, nullable=False, default=False)
     pagado_at = db.Column(db.DateTime, nullable=True)
 
+    # -------------------------
     # Relaciones
+    # -------------------------
+    # Detalles del viaje (1 talón = 1 liquidación, N renglones)
+    detalles = db.relationship(
+        "LiquidacionDetalle",
+        backref="liquidacion",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="LiquidacionDetalle.id",
+    )
+
     deducciones = db.relationship(
         "LiquidacionDeduccion",
         backref="liquidacion",
@@ -173,16 +187,17 @@ class Liquidacion(db.Model):
         UniqueConstraint("client_id", "folio_num", name="uq_liq_client_folio_num"),
         UniqueConstraint("client_id", "folio", name="uq_liq_client_folio"),
 
-        # NUEVO: evitar talones duplicados dentro del mismo cliente (si talon_interno no es NULL)
-        UniqueConstraint("client_id", "talon_interno", name="uq_liq_client_talon_interno"),
-
-        # NUEVO: unicidad por serie+seq (solo aplica cuando ambos no son NULL)
-        UniqueConstraint("client_id", "talon_folio", "talon_seq", name="uq_liq_client_talon_folio_seq"),
-
         CheckConstraint(f"status IN {LIQ_STATUS_CHOICES}", name="ck_liq_status_valid"),
 
         # Validaciones mínimas de talón (permitimos NULL para legacy)
         CheckConstraint("talon_seq IS NULL OR talon_seq >= 1", name="ck_liq_talon_seq_valid"),
+
+        # ✅ máximo 12 dígitos (0..999,999,999,999; aquí >=1 por constraint anterior)
+        CheckConstraint(
+            "talon_seq IS NULL OR talon_seq <= 999999999999",
+            name="ck_liq_talon_seq_max_12d",
+        ),
+
         CheckConstraint(
             "talon_folio IS NULL OR length(talon_folio) BETWEEN 2 AND 8",
             name="ck_liq_talon_folio_len",
@@ -195,9 +210,27 @@ class Liquidacion(db.Model):
         # mantenemos índice por compatibilidad y búsquedas
         Index("ix_liq_client_talon", "client_id", "talon_interno"),
 
-        # NUEVO: índices para sugerencias/orden rápidas por serie
+        # Índices para sugerencias/orden rápidas por serie
         Index("ix_liq_client_talon_folio_seq", "client_id", "talon_folio", "talon_seq"),
         Index("ix_liq_client_talon_folio", "client_id", "talon_folio"),
+
+        # ✅ Unicidad segura (Postgres) SOLO cuando no es NULL:
+        # Evita que la migración “reviente” por filas legacy con NULL.
+        Index(
+            "uq_liq_client_talon_interno_notnull",
+            "client_id",
+            "talon_interno",
+            unique=True,
+            postgresql_where=db.text("talon_interno IS NOT NULL"),
+        ),
+        Index(
+            "uq_liq_client_talon_folio_seq_notnull",
+            "client_id",
+            "talon_folio",
+            "talon_seq",
+            unique=True,
+            postgresql_where=db.text("talon_folio IS NOT NULL AND talon_seq IS NOT NULL"),
+        ),
     )
 
     # -------------------------

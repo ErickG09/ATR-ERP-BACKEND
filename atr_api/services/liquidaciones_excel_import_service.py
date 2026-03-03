@@ -3,25 +3,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from werkzeug.datastructures import FileStorage
-from sqlalchemy import desc
 from sqlalchemy.exc import IntegrityError
+from werkzeug.datastructures import FileStorage
 
-from atr_api.extensions import db
 from atr_api.errors import ApiError
+from atr_api.extensions import db
 
 from atr_api.models.talon_series_counter import TalonSeriesCounter
-from atr_api.models.talon_series import TalonSeries
+from atr_api.models.client_counter import ClientCounter
 from atr_api.models.liquidacion import Liquidacion
+from atr_api.models.liquidacion_detalle import LiquidacionDetalle
+from atr_api.models.operator import Operator
+from atr_api.models.car import Car
 
 from atr_api.schemas.liquidaciones_excel_import import parse_excel_liquidaciones
 from atr_api.services.talon_service import (
+    ensure_counter_at_least,
     normalize_folio,
-    parse_talon,
-    format_talon,
-    require_series,
+    normalize_manual_talon_with_catalog,
 )
 
 
@@ -32,22 +34,14 @@ class RowError:
     data: Dict[str, Any]
 
 
-def _get_current_counter_value(client_id: int, folio: str) -> int:
-    folio_n = normalize_folio(folio)
-    row = (
-        db.session.query(TalonSeriesCounter)
-        .filter(
-            TalonSeriesCounter.client_id == int(client_id),
-            TalonSeriesCounter.folio == folio_n,
-        )
-        .one_or_none()
-    )
-    return int(row.seq) if row else 0
+def _compact_upper(value: Any) -> str:
+    return "".join(str(value or "").strip().split()).upper()
 
 
-def _get_or_init_counter_locked(client_id: int, folio: str) -> TalonSeriesCounter:
+def _get_or_init_series_counter_locked(client_id: int, folio: str) -> TalonSeriesCounter:
     """
-    Obtiene el contador con lock (FOR UPDATE). Si no existe, lo crea.
+    Obtiene el contador con lock (FOR UPDATE). Si no existe, lo crea con tolerancia a carrera.
+    Se usa para reportar before/after; la actualización real se hace con ensure_counter_at_least().
     """
     folio_n = normalize_folio(folio)
 
@@ -63,9 +57,12 @@ def _get_or_init_counter_locked(client_id: int, folio: str) -> TalonSeriesCounte
     if row:
         return row
 
-    row = TalonSeriesCounter(client_id=int(client_id), folio=folio_n, seq=0)
-    db.session.add(row)
-    db.session.flush()
+    try:
+        with db.session.begin_nested():
+            db.session.add(TalonSeriesCounter(client_id=int(client_id), folio=folio_n, seq=0))
+            db.session.flush()
+    except IntegrityError:
+        pass
 
     row2 = (
         db.session.query(TalonSeriesCounter)
@@ -74,70 +71,278 @@ def _get_or_init_counter_locked(client_id: int, folio: str) -> TalonSeriesCounte
             TalonSeriesCounter.folio == folio_n,
         )
         .with_for_update()
-        .one()
+        .one_or_none()
     )
+    if not row2:
+        raise ApiError("No se pudo inicializar el contador de la serie.", status_code=500)
+
     return row2
 
 
-def _get_last_liquidacion_seq_for_folio(client_id: int, folio: str) -> int:
+def _ensure_counter_at_least_locked(client_id: int, folio: str, seq_used: int) -> Dict[str, Any]:
     """
-    Regresa el máximo talon_seq en liquidaciones para ese (client_id, folio).
-    Si no hay, regresa 0.
+    Asegura contador >= seq_used (con lock). Retorna before/after para reportar.
     """
     folio_n = normalize_folio(folio)
+    ctr = _get_or_init_series_counter_locked(client_id, folio_n)
+    before = int(ctr.seq or 0)
 
-    # Ruta robusta: usa columnas nuevas
-    q = (
+    ensure_counter_at_least(int(client_id), folio_n, int(seq_used or 0))
+
+    after = int(ctr.seq or 0)
+    return {"folio": folio_n, "seq_before": before, "seq_after": after}
+
+
+# --------------------------
+# Helpers: resolver catálogos
+# --------------------------
+
+def _q_by_client_if_exists(model, client_id: int):
+    q = db.session.query(model)
+    if hasattr(model, "client_id"):
+        q = q.filter(getattr(model, "client_id") == int(client_id))
+    return q
+
+
+def _resolve_operator_id_from_excel(client_id: int, raw_name: Any) -> Optional[int]:
+    """
+    Intenta resolver operator_id a partir del texto del Excel (operador_1 / operador_2).
+
+    Estrategia:
+      1) Exact match por nombre/alias comunes (si existen columnas).
+      2) Fallback por ilike en columnas típicas.
+
+    Si no se puede resolver, regresa None.
+    """
+    name = (str(raw_name or "")).strip()
+    if not name:
+        return None
+
+    name_u = name.strip()
+    q = _q_by_client_if_exists(Operator, client_id)
+
+    # Intentar columnas típicas si existen
+    candidates_cols = []
+    for col in ("nombre", "name", "full_name", "alias", "codigo", "code"):
+        if hasattr(Operator, col):
+            candidates_cols.append(getattr(Operator, col))
+
+    # 1) exact
+    for col in candidates_cols:
+        row = q.filter(col == name_u).first()
+        if row:
+            return int(row.id)
+
+    # 2) ilike
+    like = f"%{name_u}%"
+    for col in candidates_cols:
+        try:
+            row = q.filter(col.ilike(like)).first()
+            if row:
+                return int(row.id)
+        except Exception:
+            continue
+
+    return None
+
+
+def _resolve_car_id_from_excel(client_id: int, raw_car: Any) -> Optional[int]:
+    """
+    Resuelve car_id por texto del Excel (carro/unidad/placas).
+
+    Se intenta por campos típicos: codigo/code/placas/nombre.
+    Si no se puede resolver, regresa None.
+    """
+    s = (str(raw_car or "")).strip()
+    if not s:
+        return None
+
+    q = _q_by_client_if_exists(Car, client_id)
+
+    candidates_cols = []
+    for col in ("codigo", "code", "placas", "nombre", "name"):
+        if hasattr(Car, col):
+            candidates_cols.append(getattr(Car, col))
+
+    # exact
+    for col in candidates_cols:
+        row = q.filter(col == s).first()
+        if row:
+            return int(row.id)
+
+    # ilike
+    like = f"%{s}%"
+    for col in candidates_cols:
+        try:
+            row = q.filter(col.ilike(like)).first()
+            if row:
+                return int(row.id)
+        except Exception:
+            continue
+
+    return None
+
+
+def _parse_iso_date_to_date(v: Any) -> Optional[date]:
+    """
+    v viene del parser como 'YYYY-MM-DD' o None.
+    """
+    if not v:
+        return None
+    if isinstance(v, date) and not isinstance(v, datetime):
+        return v
+    if isinstance(v, datetime):
+        return v.date()
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s)
+    except Exception:
+        return None
+
+
+# --------------------------
+# Helpers: folio Liquidacion
+# --------------------------
+
+def _get_or_init_client_counter_locked(client_id: int) -> ClientCounter:
+    ctr = (
+        db.session.query(ClientCounter)
+        .filter(ClientCounter.client_id == int(client_id))
+        .with_for_update()
+        .one_or_none()
+    )
+    if ctr:
+        return ctr
+
+    # tolerar carrera
+    try:
+        with db.session.begin_nested():
+            db.session.add(ClientCounter(client_id=int(client_id), liquidacion_folio_seq=0))
+            db.session.flush()
+    except IntegrityError:
+        pass
+
+    ctr2 = (
+        db.session.query(ClientCounter)
+        .filter(ClientCounter.client_id == int(client_id))
+        .with_for_update()
+        .one_or_none()
+    )
+    if not ctr2:
+        raise ApiError("No se pudo inicializar el contador de liquidación.", status_code=500)
+    return ctr2
+
+
+def _allocate_next_liquidacion_folio_locked(client_id: int) -> Tuple[int, str]:
+    ctr = _get_or_init_client_counter_locked(client_id)
+    ctr.liquidacion_folio_seq = int(ctr.liquidacion_folio_seq or 0) + 1
+    folio_num = int(ctr.liquidacion_folio_seq)
+    folio = Liquidacion.format_folio(folio_num)
+    db.session.flush()
+    return folio_num, folio
+
+
+# --------------------------
+# Persistencia (cabecera + detalles)
+# --------------------------
+
+def _find_liquidacion_by_talon(client_id: int, talon_interno: str) -> Optional[Liquidacion]:
+    return (
         db.session.query(Liquidacion)
         .filter(
             Liquidacion.client_id == int(client_id),
-            Liquidacion.talon_folio == folio_n,
-            Liquidacion.talon_seq.isnot(None),
+            Liquidacion.talon_interno == talon_interno,
         )
-        .order_by(desc(Liquidacion.talon_seq), desc(Liquidacion.id))
+        .one_or_none()
     )
-    liq = q.first()
-    if not liq:
-        return 0
-    try:
-        return int(liq.talon_seq or 0)
-    except Exception:
-        return 0
 
 
-def _build_series_map(client_id: int, folios: List[str]) -> Dict[str, TalonSeries]:
-    """
-    Valida que todas las series existan y estén activas.
-    Regresa dict folio->TalonSeries.
-    """
-    out: Dict[str, TalonSeries] = {}
-    for f in folios:
-        s = require_series(client_id, f)
-        out[s.folio] = s
-    return out
-
-
-def _group_rows_by_folio(
+def _replace_detalles_for_liquidacion(
+    *,
     client_id: int,
-    rows: List[Dict[str, Any]],
-    errors: List[RowError],
-) -> Dict[str, List[Dict[str, Any]]]:
+    liq: Liquidacion,
+    details: List[Dict[str, Any]],
+) -> Dict[str, int]:
     """
-    Agrupa filas por folio detectado desde talon_interno usando el catálogo real
-    (TalonSeries activas del cliente), no parse_talon().
-
-    Adjunta en cada fila:
-      _folio
-      _seq_provided
-      _talon_provided (raw del excel)
-      _talon_normalized (talón con padding correcto)
+    Reemplaza todos los detalles de una liquidación por los del import actual.
+    Retorna contadores {deleted, inserted}.
     """
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    deleted = (
+        db.session.query(LiquidacionDetalle)
+        .filter(
+            LiquidacionDetalle.client_id == int(client_id),
+            LiquidacionDetalle.liquidacion_id == int(liq.id),
+        )
+        .delete(synchronize_session=False)
+    )
 
-    # NUEVO: usar normalización por catálogo
-    from atr_api.services.talon_service import normalize_manual_talon_with_catalog
+    inserted = 0
+    for d in details:
+        det = LiquidacionDetalle(
+            client_id=int(client_id),
+            liquidacion_id=int(liq.id),
+            row_number=int(d.get("_row_number") or 0) or None,
+            fecha=_parse_iso_date_to_date(d.get("fecha")),
+            factura_cp=(d.get("factura_cp") or None),
+            carro=(d.get("carro") or None),
+            dealer=(d.get("dealer") or None),
+            unidades=d.get("unidades"),
+            kms=d.get("kms"),
+            operador_1=(d.get("operador_1") or None),
+            operador_2=(d.get("operador_2") or None),
+            flete=d.get("flete"),
+            iva=d.get("iva"),
+            retencion=d.get("retencion"),
+            total=d.get("total"),
+            anticipo_1=d.get("anticipo_1"),
+            recibo_1=(d.get("recibo_1") or None),
+            anticipo_2=d.get("anticipo_2"),
+            recibo_2=(d.get("recibo_2") or None),
+        )
+        db.session.add(det)
+        inserted += 1
 
-    for item in rows:
+    db.session.flush()
+    return {"deleted": int(deleted or 0), "inserted": int(inserted or 0)}
+
+
+def import_liquidaciones_from_excel(
+    *,
+    client_id: int,
+    file_storage: FileStorage,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Import/validación de Excel de VIAJES por talón interno.
+
+    Reglas:
+      - Acepta talones con consecutivo libre (1..12 dígitos) sin forzar padding.
+      - Talón repetido en el Excel NO es error: representa el mismo viaje con varios renglones/detalles.
+      - NO reasigna consecutivos.
+      - Si dry_run=False:
+          1) crea/actualiza Liquidacion (cabecera) por talón
+          2) reemplaza detalles (LiquidacionDetalle) por lo que venga en el Excel
+          3) sube TalonSeriesCounter.seq al máximo consecutivo visto por folio.
+    """
+    try:
+        parsed_rows = parse_excel_liquidaciones(file_storage)
+    except ApiError:
+        raise
+    except Exception as e:
+        raise ApiError(f"No se pudo leer el Excel: {e}", status_code=400)
+
+    errors: List[RowError] = []
+    rows_out: List[Dict[str, Any]] = []
+
+    # Agrupación por viaje (talón)
+    trips_map: Dict[str, Dict[str, Any]] = {}
+
+    # Máximo consecutivo por folio
+    max_seq_by_folio: Dict[str, int] = {}
+
+    for item in parsed_rows:
         row_number = int(item.get("_row_number") or 0)
         payload = dict(item.get("payload") or {})
 
@@ -180,295 +385,235 @@ def _group_rows_by_folio(
             )
             continue
 
-        # Enriquecer payload
-        payload["_row_number"] = row_number
-        payload["_talon_provided"] = talon_raw.strip().upper()
-        payload["_talon_normalized"] = talon_norm  # ya con padding correcto
-        payload["_folio"] = folio                  # normalizado
-        payload["_seq_provided"] = int(seq)
+        folio_n = normalize_folio(folio)
+        seq_i = int(seq)
 
-        # Importante: si quieres que el resto del pipeline use el talón ya normalizado:
+        # máximo por folio
+        prev_max = int(max_seq_by_folio.get(folio_n, 0))
+        if seq_i > prev_max:
+            max_seq_by_folio[folio_n] = seq_i
+
+        # fila plana (útil para depuración/UI)
+        payload["_row_number"] = row_number
+        payload["_talon_provided"] = _compact_upper(talon_raw)
+        payload["_folio"] = folio_n
+        payload["_seq"] = seq_i
+
+        # talón final (sin padding)
         payload["talon_interno"] = talon_norm
 
-        grouped.setdefault(folio, []).append(payload)
+        rows_out.append(payload)
 
-    return grouped
+        # agrupar por talón (viaje)
+        trip = trips_map.get(talon_norm)
+        if not trip:
+            trip = {
+                "talon_interno": talon_norm,
+                "talon_folio": folio_n,
+                "talon_seq": seq_i,
+                "rows_count": 0,
+                "details": [],
+            }
+            trips_map[talon_norm] = trip
 
+        trip["rows_count"] = int(trip["rows_count"] or 0) + 1
 
+        # detalle/renglón del Excel (lo que persistiremos en LiquidacionDetalle)
+        trip["details"].append(
+            {
+                "_row_number": row_number,
+                "fecha": payload.get("fecha") or None,
+                "factura_cp": payload.get("factura_cp") or None,
+                "carro": payload.get("carro") or None,
+                "dealer": payload.get("dealer") or None,
+                "unidades": payload.get("unidades"),
+                "kms": payload.get("kms"),
+                "operador_1": payload.get("operador_1") or None,
+                "operador_2": payload.get("operador_2") or None,
+                "flete": payload.get("flete"),
+                "iva": payload.get("iva"),
+                "retencion": payload.get("retencion"),
+                "total": payload.get("total"),
+                "anticipo_1": payload.get("anticipo_1"),
+                "recibo_1": payload.get("recibo_1") or None,
+                "anticipo_2": payload.get("anticipo_2"),
+                "recibo_2": payload.get("recibo_2") or None,
+            }
+        )
 
-def _assign_expected_seqs_for_folio(
-    *,
-    series: TalonSeries,
-    start_last_seq: int,
-    rows_for_folio: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Asigna secuencias esperadas a las filas (en el orden en que aparecen en el Excel).
-    Corrige consecutivos si el usuario se saltó números.
-
-    Retorna:
-      - filas enriquecidas con:
-          _seq_expected
-          talon_interno_corrected
-          talon_interno_final
-          _was_corrected (bool)
-      - lista de correcciones
-    """
-    padding = int(series.padding or 5)
-    folio = series.folio
-
-    corrections: List[Dict[str, Any]] = []
-    enriched: List[Dict[str, Any]] = []
-
-    expected = int(start_last_seq) + 1
-
-    for r in rows_for_folio:
-        row_number = int(r.get("_row_number") or 0)
-        provided_talon = str(r.get("_talon_provided") or "").strip().upper()
-        normalized_talon = str(r.get("_talon_normalized") or provided_talon).strip().upper()
-
-        provided_seq = int(r.get("_seq_provided") or 0)
-
-        corrected_talon = format_talon(folio, expected, padding)
-
-        was_corrected = (provided_seq != expected) or (normalized_talon != corrected_talon)
-
-
-        if was_corrected:
-            corrections.append(
-                {
-                    "row": row_number,
-                    "folio": folio,
-                    "provided": provided_talon,
-                    "provided_seq": provided_seq,
-                    "expected_seq": expected,
-                    "corrected": corrected_talon,
-                    "reason": (
-                        "Consecutivo no coincide con el esperado (se reasignó para mantener continuidad)."
-                    ),
-                }
-            )
-
-        r2 = dict(r)
-        r2["_seq_expected"] = expected
-        r2["talon_interno_corrected"] = corrected_talon
-        r2["talon_interno_final"] = corrected_talon  # por ahora final = corrected
-        r2["_was_corrected"] = bool(was_corrected)
-
-        enriched.append(r2)
-        expected += 1
-
-    return enriched, corrections
-
-
-def import_liquidaciones_from_excel(
-    *,
-    client_id: int,
-    file_storage: FileStorage,
-    dry_run: bool = False,
-) -> Dict[str, Any]:
-    """
-    Import/validación de Excel de VIAJES por talón interno.
-
-    Qué hace HOY (backend fino para el Excel):
-      - Lee Excel.
-      - Valida que talon_interno tenga formato PREFIJO+NÚMERO.
-      - Valida que el PREFIJO exista y esté activo en TalonSeries del cliente.
-      - Calcula el 'last_seq' real por folio usando:
-          max(ultimo talon_seq guardado en liquidaciones, contador actual)
-      - Reasigna consecutivos esperados en continuidad para las filas del Excel (por folio),
-        y genera talon_interno_corrected.
-      - Detecta duplicados dentro del archivo después de corrección.
-      - Si dry_run=0:
-          - actualiza TalonSeriesCounter.seq por folio al último consecutivo resultante,
-            usando lock FOR UPDATE para concurrencia.
-
-    Qué NO hace aún:
-      - No crea Liquidaciones (porque todavía no definimos dónde persistir los campos del Excel
-        como FACTURA/DEALER/etc). Esto solo deja listo el motor de validación y el contador.
-    """
-    try:
-        parsed_rows = parse_excel_liquidaciones(file_storage)
-    except ApiError:
-        raise
-    except Exception as e:
-        raise ApiError(f"No se pudo leer el Excel: {e}", status_code=400)
-
-    errors: List[RowError] = []
-    grouped = _group_rows_by_folio(client_id, parsed_rows, errors)
-
-    if errors and not grouped:
-        # Si no hay ni una fila utilizable, cortamos temprano
+    # Si todo falló y solo hay errores
+    if errors and not rows_out:
         return {
             "dry_run": dry_run,
             "total_rows": len(parsed_rows),
             "folios_count": 0,
             "folios": [],
             "rows_out": [],
-            "corrections_count": 0,
-            "corrections": [],
+            "trips_count": 0,
+            "trips": [],
             "duplicates_count": 0,
             "duplicates": [],
             "errors_count": len(errors),
             "errors": [{"row": e.row_number, "message": e.message, "data": e.data} for e in errors],
             "updated_counters": [],
+            "summary_by_folio": [],
+            "persist": {
+                "created_liquidaciones": 0,
+                "updated_liquidaciones": 0,
+                "replaced_detalles": 0,
+                "inserted_detalles": 0,
+                "deleted_detalles": 0,
+            },
         }
 
-    folios = sorted(grouped.keys())
-
-    # Valida catálogo de series (todas deben existir)
-    try:
-        series_map = _build_series_map(client_id, folios)
-    except ApiError as e:
-        # Error de catálogo es global, pero lo reportamos como error general
-        raise ApiError(str(e), status_code=e.status_code or 400)
-
-    # -------------------------------------------------------------------------
-    # Paso 1: calcular last_seq por folio (sin lock; para pre-validación)
-    # -------------------------------------------------------------------------
-    pre_last_seq: Dict[str, int] = {}
-    for folio in folios:
-        last_from_liq = _get_last_liquidacion_seq_for_folio(client_id, folio)
-        last_from_ctr = _get_current_counter_value(client_id, folio)
-        pre_last_seq[folio] = max(int(last_from_liq or 0), int(last_from_ctr or 0))
-
-    # -------------------------------------------------------------------------
-    # Paso 2: asignar expected seq y corregir talones (por folio)
-    # -------------------------------------------------------------------------
-    all_rows_out: List[Dict[str, Any]] = []
-    all_corrections: List[Dict[str, Any]] = []
-
-    for folio in folios:
-        series = series_map[folio]
-        rows_for_folio = grouped[folio]
-        enriched, corrections = _assign_expected_seqs_for_folio(
-            series=series,
-            start_last_seq=pre_last_seq[folio],
-            rows_for_folio=rows_for_folio,
-        )
-        all_rows_out.extend(enriched)
-        all_corrections.extend(corrections)
-
-    # -------------------------------------------------------------------------
-    # Paso 3: detectar duplicados dentro del archivo (después de corrección)
-    # -------------------------------------------------------------------------
-    seen: Dict[str, int] = {}
+    # “Duplicados” informativos: mismo talón con múltiples renglones
     duplicates: List[Dict[str, Any]] = []
-    for r in all_rows_out:
-        t = str(r.get("talon_interno_final") or "").strip().upper()
-        if not t:
-            continue
-        if t in seen:
+    for talon, trip in trips_map.items():
+        if int(trip.get("rows_count") or 0) > 1:
+            details = trip.get("details") or []
+            first_row = int(details[0].get("_row_number") or 0) if details else 0
             duplicates.append(
                 {
-                    "talon_interno": t,
-                    "first_row": seen[t],
-                    "dup_row": int(r.get("_row_number") or 0),
-                    "reason": "Talón duplicado dentro del archivo (después de corrección).",
+                    "talon_interno": talon,
+                    "first_row": first_row,
+                    "dup_rows": [int(d.get("_row_number") or 0) for d in details[1:]],
+                    "reason": "Mismo viaje con varias cartas porte / dealers (válido).",
                 }
             )
-        else:
-            seen[t] = int(r.get("_row_number") or 0)
 
-    if duplicates:
-        # Si hay duplicados, no debemos actualizar counters (porque el set resultante no es válido)
-        return {
-            "dry_run": dry_run,
-            "total_rows": len(parsed_rows),
-            "folios_count": len(folios),
-            "folios": folios,
-            "rows_out": sorted(all_rows_out, key=lambda x: int(x.get("_row_number") or 0)),
-            "corrections_count": len(all_corrections),
-            "corrections": sorted(all_corrections, key=lambda x: int(x.get("row") or 0)),
-            "duplicates_count": len(duplicates),
-            "duplicates": duplicates,
-            "errors_count": len(errors),
-            "errors": [{"row": e.row_number, "message": e.message, "data": e.data} for e in errors],
-            "updated_counters": [],
-        }
+    folios = sorted(list(max_seq_by_folio.keys()))
 
-    # -------------------------------------------------------------------------
-    # Paso 4: persistir actualización de contadores (si NO dry_run)
-    #         Con lock para proteger concurrencia.
-    #         Si el contador avanzó entre el Paso 1 y aquí, reajustamos para ese folio.
-    # -------------------------------------------------------------------------
-    updated_counters: List[Dict[str, Any]] = []
+    # -------------------------
+    # Persistencia: cabecera + detalles (solo si NO dry_run)
+    # -------------------------
+    created_liqs = 0
+    updated_liqs = 0
+    replaced_detalles = 0
+    inserted_detalles = 0
+    deleted_detalles = 0
+    persisted: List[Dict[str, Any]] = []
 
     if not dry_run:
         try:
-            # Procesamos folio por folio para tener locks acotados.
-            for folio in folios:
-                series = series_map[folio]
-                padding = int(series.padding or 5)
+            # 1) Crear/actualizar liquidaciones por talón + guardar detalles
+            for talon, trip in trips_map.items():
+                talon_interno = str(trip.get("talon_interno") or "").strip()
+                talon_folio = str(trip.get("talon_folio") or "").strip()
+                talon_seq = int(trip.get("talon_seq") or 0) or None
+                details = list(trip.get("details") or [])
 
-                # Lock del contador
-                ctr = _get_or_init_counter_locked(client_id, folio)
+                if not talon_interno or not talon_folio or not talon_seq:
+                    continue
 
-                last_from_liq = _get_last_liquidacion_seq_for_folio(client_id, folio)
-                last_locked = max(int(ctr.seq or 0), int(last_from_liq or 0))
+                liq = _find_liquidacion_by_talon(int(client_id), talon_interno)
 
-                # Tomamos las filas de este folio, en el orden del Excel
-                rows_this = [r for r in all_rows_out if str(r.get("_folio") or "") == folio]
-                rows_this_sorted = sorted(rows_this, key=lambda x: int(x.get("_row_number") or 0))
+                # Resolver campos “mínimos razonables” desde el primer renglón
+                first = details[0] if details else {}
+                fecha_dt = _parse_iso_date_to_date(first.get("fecha")) or date.today()
 
-                # Si cambió el start por concurrencia, recalculamos los talones finales de este folio
-                desired_start = last_locked + 1
-                expected = desired_start
+                op1_id = _resolve_operator_id_from_excel(client_id, first.get("operador_1"))
+                op2_id = _resolve_operator_id_from_excel(client_id, first.get("operador_2"))
+                car_id = _resolve_car_id_from_excel(client_id, first.get("carro"))
 
-                for r in rows_this_sorted:
-                    final_talon = format_talon(folio, expected, padding)
-
-                    # Si esto cambia vs lo que ya traíamos, lo anotamos como corrección adicional
-                    prev_final = str(r.get("talon_interno_final") or "").strip().upper()
-                    if prev_final != final_talon:
-                        all_corrections.append(
-                            {
-                                "row": int(r.get("_row_number") or 0),
-                                "folio": folio,
-                                "provided": str(r.get("_talon_provided") or "").strip().upper(),
-                                "provided_seq": int(r.get("_seq_provided") or 0),
-                                "expected_seq": expected,
-                                "corrected": final_talon,
-                                "reason": "El contador avanzó por concurrencia; se reasignó el rango para evitar colisiones.",
-                            }
+                # Si tu tabla Liquidacion exige operator_id NOT NULL, esto debe resolverse.
+                # Si no se puede, lo marcamos como error “de viaje” y NO lo persistimos.
+                if not op1_id:
+                    errors.append(
+                        RowError(
+                            row_number=int(first.get("_row_number") or 0),
+                            message=f"No se pudo resolver operator_id desde Excel (operador_1='{first.get('operador_1') or ''}'). "
+                                    f"Registra el operador en el catálogo o ajusta el texto del Excel.",
+                            data={"talon_interno": talon_interno, "operador_1": first.get("operador_1")},
                         )
+                    )
+                    continue
 
-                    r["_seq_expected"] = expected
-                    r["talon_interno_final"] = final_talon
-                    expected += 1
+                if liq is None:
+                    folio_num, folio_auto = _allocate_next_liquidacion_folio_locked(int(client_id))
 
-                # El último usado será expected-1
-                last_used_after_import = expected - 1
-                if last_used_after_import < int(ctr.seq or 0):
-                    # No debería pasar, pero por seguridad no retrocedemos
-                    last_used_after_import = int(ctr.seq or 0)
+                    liq = Liquidacion(
+                        client_id=int(client_id),
+                        folio_num=int(folio_num),
+                        folio=str(folio_auto),
+                        fecha=fecha_dt,
+                        talon_interno=talon_interno,
+                        talon_folio=normalize_folio(talon_folio),
+                        talon_seq=int(talon_seq),
+                        operator_id=int(op1_id),
+                        operator2_id=int(op2_id) if op2_id else None,
+                        car_id=int(car_id) if car_id else None,
+                        destination_id=None,
+                        # Campos numéricos básicos (no forzamos cálculos aquí)
+                        kms=0,
+                        tarifa=0,
+                        aplica_iva=False,
+                        iva_pct=0,
+                        aplica_retencion=False,
+                        retencion_pct=0,
+                        status="draft",
+                        activo=True,
+                    )
+                    db.session.add(liq)
+                    db.session.flush()
+                    created_liqs += 1
+                    action = "created"
+                else:
+                    # Actualiza campos “snap” si estaban vacíos o si quieres sincronizar
+                    # (lo dejamos conservador para no pisar capturas manuales ya hechas).
+                    if not getattr(liq, "fecha", None):
+                        liq.fecha = fecha_dt
+                    if not getattr(liq, "operator_id", None):
+                        liq.operator_id = int(op1_id)
+                    if op2_id and not getattr(liq, "operator2_id", None):
+                        liq.operator2_id = int(op2_id)
+                    if car_id and not getattr(liq, "car_id", None):
+                        liq.car_id = int(car_id)
 
-                before = int(ctr.seq or 0)
-                ctr.seq = int(last_used_after_import)
-                db.session.flush()
+                    # Asegurar talón_folio/talon_seq consistentes
+                    liq.talon_interno = talon_interno
+                    liq.talon_folio = normalize_folio(talon_folio)
+                    liq.talon_seq = int(talon_seq)
 
-                updated_counters.append(
+                    db.session.flush()
+                    updated_liqs += 1
+                    action = "updated"
+
+                # Reemplazar detalles del viaje (talón)
+                rep = _replace_detalles_for_liquidacion(
+                    client_id=int(client_id),
+                    liq=liq,
+                    details=details,
+                )
+                replaced_detalles += 1
+                deleted_detalles += int(rep["deleted"])
+                inserted_detalles += int(rep["inserted"])
+
+                persisted.append(
                     {
-                        "folio": folio,
-                        "seq_before": before,
-                        "seq_after": int(ctr.seq or 0),
-                        "rows_count": len(rows_this_sorted),
-                        "range_assigned": (
-                            f"{format_talon(folio, desired_start, padding)}"
-                            f" .. "
-                            f"{format_talon(folio, int(ctr.seq or 0), padding)}"
-                            if len(rows_this_sorted) > 0
-                            else None
-                        ),
+                        "talon_interno": talon_interno,
+                        "liquidacion_id": int(liq.id),
+                        "action": action,
+                        "detalles_deleted": int(rep["deleted"]),
+                        "detalles_inserted": int(rep["inserted"]),
                     }
                 )
 
+            # 2) Actualizar contadores de series (talón) al máximo visto
+            updated_counters: List[Dict[str, Any]] = []
+            for folio in folios:
+                max_seq = int(max_seq_by_folio.get(folio, 0) or 0)
+                if max_seq <= 0:
+                    continue
+                info = _ensure_counter_at_least_locked(int(client_id), folio, max_seq)
+                updated_counters.append(info)
+
             db.session.commit()
 
-        except IntegrityError:
+        except IntegrityError as e:
             db.session.rollback()
+            msg = str(e.orig) if hasattr(e, "orig") else str(e)
             raise ApiError(
-                "Error de integridad actualizando contadores de talón. Revisa el archivo y vuelve a intentar.",
+                f"Error de integridad importando Excel. Revisa datos/duplicados. Detalle: {msg}",
                 status_code=409,
             )
         except ApiError:
@@ -478,47 +623,26 @@ def import_liquidaciones_from_excel(
             db.session.rollback()
             raise ApiError(f"Error inesperado importando Excel: {e}", status_code=500)
 
-    # Resumen final por folio (con lo que quedó en rows_out / counters)
+    else:
+        updated_counters = []
+
+    # Resumen por folio
     summary_by_folio: List[Dict[str, Any]] = []
-    rows_sorted = sorted(all_rows_out, key=lambda x: int(x.get("_row_number") or 0))
-
-    # Recomputa last seq final por folio según lo asignado (sin depender del counter)
-    final_max_seq: Dict[str, int] = {f: 0 for f in folios}
-    for r in rows_sorted:
-        f = str(r.get("_folio") or "")
-        if not f:
-            continue
-        try:
-            s = int(r.get("_seq_expected") or 0)
-        except Exception:
-            s = 0
-        final_max_seq[f] = max(final_max_seq.get(f, 0), s)
-
     for folio in folios:
-        series = series_map[folio]
-        padding = int(series.padding or 5)
-
-        start_last = pre_last_seq.get(folio, 0)
-        next_seq_start = int(start_last) + 1
-        end_seq = final_max_seq.get(folio, 0)
-
-        if end_seq <= 0:
-            next_after = next_seq_start
-        else:
-            next_after = end_seq + 1
-
         summary_by_folio.append(
             {
                 "folio": folio,
-                "padding": padding,
-                "last_seq_before": int(start_last),
-                "next_seq_assigned_start": int(next_seq_start),
-                "last_seq_assigned_end": int(end_seq) if end_seq > 0 else int(start_last),
-                "next_seq_after_import": int(next_after),
-                "next_talon_after_import": format_talon(folio, int(next_after), padding),
-                "rows_count": len([r for r in rows_sorted if str(r.get("_folio") or "") == folio]),
+                "max_seq_seen_in_excel": int(max_seq_by_folio.get(folio, 0) or 0),
+                "rows_count": len([r for r in rows_out if str(r.get("_folio") or "") == folio]),
+                "trips_count": len([t for t in trips_map.values() if str(t.get("talon_folio") or "") == folio]),
             }
         )
+
+    rows_sorted = sorted(rows_out, key=lambda x: int(x.get("_row_number") or 0))
+    trips_sorted = sorted(
+        trips_map.values(),
+        key=lambda x: (str(x.get("talon_folio") or ""), int(x.get("talon_seq") or 0)),
+    )
 
     return {
         "dry_run": dry_run,
@@ -526,12 +650,21 @@ def import_liquidaciones_from_excel(
         "folios_count": len(folios),
         "folios": folios,
         "rows_out": rows_sorted,
-        "corrections_count": len(all_corrections),
-        "corrections": sorted(all_corrections, key=lambda x: int(x.get("row") or 0)),
-        "duplicates_count": 0,
-        "duplicates": [],
+        "trips_count": len(trips_sorted),
+        "trips": trips_sorted,
+        "duplicates_count": len(duplicates),
+        "duplicates": duplicates,
         "errors_count": len(errors),
         "errors": [{"row": e.row_number, "message": e.message, "data": e.data} for e in errors],
         "summary_by_folio": summary_by_folio,
         "updated_counters": updated_counters,
+        # Nuevo: resumen de persistencia para que el frontend/tu debug vea qué guardó
+        "persist": {
+            "created_liquidaciones": int(created_liqs),
+            "updated_liquidaciones": int(updated_liqs),
+            "replaced_detalles": int(replaced_detalles),
+            "inserted_detalles": int(inserted_detalles),
+            "deleted_detalles": int(deleted_detalles),
+            "items": persisted,
+        },
     }

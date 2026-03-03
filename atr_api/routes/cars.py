@@ -12,6 +12,16 @@ from atr_api.schemas.car import sanitize_car_payload, serialize_car, calc_rendim
 
 bp = Blueprint("cars", __name__)
 
+# ---------------------------------------------------------------------
+# Config paginación
+# - Antes tenías max 100; por eso “no ves” más de 100.
+# - Subimos max a 1000 para debugging/uso real.
+# - per_page=0 significa “trae todo”, pero con tope de seguridad.
+# ---------------------------------------------------------------------
+DEFAULT_PER_PAGE = 50
+MAX_PER_PAGE = 1000
+MAX_PER_PAGE_ALL = 5000  # seguridad cuando piden per_page=0
+
 
 def _get_car_global(client_id: int, car_id: int) -> Car:
     """
@@ -32,25 +42,19 @@ def _get_car_global(client_id: int, car_id: int) -> Car:
     return car
 
 
-@bp.get("/clients/<int:client_id>/cars")
-def list_cars(client_id: int):
-    page = request.args.get("page", default=1, type=int)
-    per_page = request.args.get("per_page", default=50, type=int)
-    per_page = min(max(per_page, 1), 100)
+def _parse_bool_arg(name: str, default: bool) -> bool:
+    raw = request.args.get(name, None)
+    if raw is None:
+        return default
+    return str(raw).lower() in ("1", "true", "t", "yes", "y", "si", "sí", "s")
 
-    # Por defecto: GLOBAL
-    include_all = request.args.get("include_all", "1").lower() in ("1", "true", "t", "yes", "y")
 
-    if include_all:
-        query = Car.query
-    else:
-        query = Car.query.filter_by(client_id=client_id)
-
+def _apply_common_filters(query):
     # Filtro por activo
     activo_param = request.args.get("activo")
     if activo_param is not None:
         value = activo_param.lower()
-        if value in ("true", "1", "t", "yes", "y"):
+        if value in ("true", "1", "t", "yes", "y", "si", "sí", "s"):
             query = query.filter_by(activo=True)
         elif value in ("false", "0", "f", "no", "n"):
             query = query.filter_by(activo=False)
@@ -60,6 +64,54 @@ def list_cars(client_id: int):
     if search:
         like = f"%{search}%"
         query = query.filter((Car.codigo.ilike(like)) | (Car.operador.ilike(like)))
+
+    return query
+
+
+@bp.get("/clients/<int:client_id>/cars")
+def list_cars(client_id: int):
+    page = request.args.get("page", default=1, type=int)
+    per_page = request.args.get("per_page", default=DEFAULT_PER_PAGE, type=int)
+
+    # Por defecto: GLOBAL (mantengo tu comportamiento)
+    include_all = _parse_bool_arg("include_all", default=True)
+
+    if include_all:
+        query = Car.query
+    else:
+        query = Car.query.filter_by(client_id=client_id)
+
+    query = _apply_common_filters(query)
+
+    # per_page=0 => traer todo (con tope de seguridad)
+    if per_page == 0:
+        try:
+            items = (
+                query.order_by(Car.codigo.asc())
+                .limit(MAX_PER_PAGE_ALL)
+                .all()
+            )
+        except OperationalError:
+            db.session.rollback()
+            raise ApiError("Conexión a la base de datos interrumpida. Intenta de nuevo.", status_code=503)
+
+        serialized = [serialize_car(c) for c in items]
+
+        # Nota: cuando per_page=0, page/pages no aplican realmente.
+        return jsonify(
+            {
+                "items": serialized,
+                "page": 1,
+                "per_page": 0,
+                "total": len(serialized),
+                "pages": 1,
+                "note": f"per_page=0 trae todo con límite {MAX_PER_PAGE_ALL}.",
+            }
+        )
+
+    # Normaliza rangos
+    per_page = max(1, min(per_page, MAX_PER_PAGE))
+    page = max(1, page)
 
     try:
         pagination = query.order_by(Car.codigo.asc()).paginate(
@@ -84,6 +136,43 @@ def list_cars(client_id: int):
     )
 
 
+@bp.get("/clients/<int:client_id>/cars/count")
+def count_cars(client_id: int):
+    """
+    Devuelve conteos de unidades.
+    Respeta los mismos filtros que list_cars:
+      - include_all=1/0
+      - activo=true/false
+      - search=...
+    """
+    include_all = _parse_bool_arg("include_all", default=True)
+
+    if include_all:
+        query = Car.query
+    else:
+        query = Car.query.filter_by(client_id=client_id)
+
+    query = _apply_common_filters(query)
+
+    try:
+        total = query.count()
+    except OperationalError:
+        db.session.rollback()
+        raise ApiError("Conexión a la base de datos interrumpida. Intenta de nuevo.", status_code=503)
+
+    return jsonify(
+        {
+            "client_id": client_id,
+            "include_all": include_all,
+            "filters": {
+                "activo": request.args.get("activo"),
+                "search": request.args.get("search"),
+            },
+            "total": total,
+        }
+    )
+
+
 @bp.get("/clients/<int:client_id>/cars/<int:car_id>")
 def get_car(client_id: int, car_id: int):
     car = _get_car_global(client_id, car_id)
@@ -100,7 +189,6 @@ def create_car(client_id: int):
     data["client_id"] = client_id
 
     car = Car(**data)
-
     car.rendimiento_promedio = calc_rendimiento_promedio(car.km_acum, car.lt_dies_ac)
 
     try:
@@ -157,7 +245,7 @@ def update_car(client_id: int, car_id: int):
 def delete_car(client_id: int, car_id: int):
     car = _get_car_global(client_id, car_id)
 
-    hard = request.args.get("hard", "0").lower() in ("1", "true", "t", "yes", "y")
+    hard = _parse_bool_arg("hard", default=False)
 
     try:
         if hard:

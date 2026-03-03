@@ -20,6 +20,12 @@ bp = Blueprint(
     url_prefix="/api/clients/<int:client_id>/talon-series",
 )
 
+# Padding permitido (catálogo)
+# Antes: 1..10
+# Ahora: 1..12 (para permitir talones con hasta 12 dígitos en el consecutivo)
+PADDING_MIN = 1
+PADDING_MAX = 12
+
 
 def _err(msg: str, code: int = 400):
     return jsonify({"error": msg}), code
@@ -33,12 +39,22 @@ def _validate_client(client_id: int):
 
 
 def _serialize(row: TalonSeries) -> Dict[str, Any]:
+    # Si hay datos viejos con padding fuera de rango, no tronamos: lo “clamp” para respuesta.
+    try:
+        pad = int(row.padding or 5)
+    except Exception:
+        pad = 5
+    if pad < PADDING_MIN:
+        pad = PADDING_MIN
+    if pad > PADDING_MAX:
+        pad = PADDING_MAX
+
     return {
         "id": int(row.id),
         "client_id": int(row.client_id),
         "folio": row.folio,
         "cliente_nombre": row.cliente_nombre,
-        "padding": int(row.padding or 5),
+        "padding": pad,
         "activo": bool(row.activo),
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
@@ -81,12 +97,14 @@ def create_series(client_id: int):
     if cliente_nombre and len(cliente_nombre) > 120:
         return _err("cliente_nombre demasiado largo (máx 120).", 400)
 
+    # padding
     try:
         padding = int(body.get("padding") or 5)
     except Exception:
-        padding = 5
-    if padding < 1 or padding > 10:
-        return _err("padding inválido (1 a 10).", 400)
+        return _err("padding inválido.", 400)
+
+    if padding < PADDING_MIN or padding > PADDING_MAX:
+        return _err(f"padding inválido ({PADDING_MIN} a {PADDING_MAX}).", 400)
 
     activo = bool(body.get("activo") is not False)
 
@@ -168,8 +186,8 @@ def update_series(client_id: int, series_id: int):
             padding = int(body.get("padding") or 5)
         except Exception:
             return _err("padding inválido.", 400)
-        if padding < 1 or padding > 10:
-            return _err("padding inválido (1 a 10).", 400)
+        if padding < PADDING_MIN or padding > PADDING_MAX:
+            return _err(f"padding inválido ({PADDING_MIN} a {PADDING_MAX}).", 400)
         row.padding = padding
 
     if "activo" in body:
@@ -217,4 +235,3 @@ def delete_series(client_id: int, series_id: int):
         return _err(f"No se pudo eliminar. {str(e)}", 400)
 
     return jsonify({"status": "deleted" if hard else "inactive", "id": int(series_id)})
-
