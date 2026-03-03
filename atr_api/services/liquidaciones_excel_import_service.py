@@ -121,19 +121,18 @@ def _resolve_operator_id_from_excel(client_id: int, raw_name: Any) -> Optional[i
     name_u = name.strip()
     q = _q_by_client_if_exists(Operator, client_id)
 
-    # Intentar columnas típicas si existen
     candidates_cols = []
     for col in ("nombre", "name", "full_name", "alias", "codigo", "code"):
         if hasattr(Operator, col):
             candidates_cols.append(getattr(Operator, col))
 
-    # 1) exact
+    # exact
     for col in candidates_cols:
         row = q.filter(col == name_u).first()
         if row:
             return int(row.id)
 
-    # 2) ilike
+    # ilike
     like = f"%{name_u}%"
     for col in candidates_cols:
         try:
@@ -216,7 +215,6 @@ def _get_or_init_client_counter_locked(client_id: int) -> ClientCounter:
     if ctr:
         return ctr
 
-    # tolerar carrera
     try:
         with db.session.begin_nested():
             db.session.add(ClientCounter(client_id=int(client_id), liquidacion_folio_seq=0))
@@ -308,6 +306,20 @@ def _replace_detalles_for_liquidacion(
     return {"deleted": int(deleted or 0), "inserted": int(inserted or 0)}
 
 
+def _sort_trip_details_inplace(trips_map: Dict[str, Dict[str, Any]]) -> None:
+    """
+    Garantiza que los details de cada talón estén en el mismo orden del Excel (por _row_number).
+    """
+    for trip in trips_map.values():
+        details = list(trip.get("details") or [])
+        details.sort(key=lambda d: int(d.get("_row_number") or 0))
+        trip["details"] = details
+
+        # first_row: primera aparición del talón en el Excel (para ordenar trips)
+        if details:
+            trip["first_row"] = int(trip.get("first_row") or 0) or int(details[0].get("_row_number") or 0)
+
+
 def import_liquidaciones_from_excel(
     *,
     client_id: int,
@@ -333,13 +345,13 @@ def import_liquidaciones_from_excel(
     except Exception as e:
         raise ApiError(f"No se pudo leer el Excel: {e}", status_code=400)
 
+    # Garantía absoluta: orden real del Excel
+    parsed_rows.sort(key=lambda x: int(x.get("_row_number") or 0))
+
     errors: List[RowError] = []
     rows_out: List[Dict[str, Any]] = []
 
-    # Agrupación por viaje (talón)
     trips_map: Dict[str, Dict[str, Any]] = {}
-
-    # Máximo consecutivo por folio
     max_seq_by_folio: Dict[str, int] = {}
 
     for item in parsed_rows:
@@ -388,29 +400,25 @@ def import_liquidaciones_from_excel(
         folio_n = normalize_folio(folio)
         seq_i = int(seq)
 
-        # máximo por folio
         prev_max = int(max_seq_by_folio.get(folio_n, 0))
         if seq_i > prev_max:
             max_seq_by_folio[folio_n] = seq_i
 
-        # fila plana (útil para depuración/UI)
         payload["_row_number"] = row_number
         payload["_talon_provided"] = _compact_upper(talon_raw)
         payload["_folio"] = folio_n
         payload["_seq"] = seq_i
-
-        # talón final (sin padding)
         payload["talon_interno"] = talon_norm
 
         rows_out.append(payload)
 
-        # agrupar por talón (viaje)
         trip = trips_map.get(talon_norm)
         if not trip:
             trip = {
                 "talon_interno": talon_norm,
                 "talon_folio": folio_n,
                 "talon_seq": seq_i,
+                "first_row": row_number,  # clave para el orden original
                 "rows_count": 0,
                 "details": [],
             }
@@ -418,7 +426,6 @@ def import_liquidaciones_from_excel(
 
         trip["rows_count"] = int(trip["rows_count"] or 0) + 1
 
-        # detalle/renglón del Excel (lo que persistiremos en LiquidacionDetalle)
         trip["details"].append(
             {
                 "_row_number": row_number,
@@ -440,6 +447,9 @@ def import_liquidaciones_from_excel(
                 "recibo_2": payload.get("recibo_2") or None,
             }
         )
+
+    # Ordenar details por fila Excel y fijar first_row correctamente
+    _sort_trip_details_inplace(trips_map)
 
     # Si todo falló y solo hay errores
     if errors and not rows_out:
@@ -463,6 +473,7 @@ def import_liquidaciones_from_excel(
                 "replaced_detalles": 0,
                 "inserted_detalles": 0,
                 "deleted_detalles": 0,
+                "items": [],
             },
         }
 
@@ -471,7 +482,7 @@ def import_liquidaciones_from_excel(
     for talon, trip in trips_map.items():
         if int(trip.get("rows_count") or 0) > 1:
             details = trip.get("details") or []
-            first_row = int(details[0].get("_row_number") or 0) if details else 0
+            first_row = int(trip.get("first_row") or 0) or (int(details[0].get("_row_number") or 0) if details else 0)
             duplicates.append(
                 {
                     "talon_interno": talon,
@@ -493,21 +504,25 @@ def import_liquidaciones_from_excel(
     deleted_detalles = 0
     persisted: List[Dict[str, Any]] = []
 
+    updated_counters: List[Dict[str, Any]] = []
+
     if not dry_run:
         try:
-            # 1) Crear/actualizar liquidaciones por talón + guardar detalles
-            for talon, trip in trips_map.items():
+            # Importante: persistir trips en el orden original del Excel (first_row)
+            for talon, trip in sorted(trips_map.items(), key=lambda kv: int(kv[1].get("first_row") or 0)):
                 talon_interno = str(trip.get("talon_interno") or "").strip()
                 talon_folio = str(trip.get("talon_folio") or "").strip()
                 talon_seq = int(trip.get("talon_seq") or 0) or None
                 details = list(trip.get("details") or [])
+
+                # Seguridad: details ya vienen ordenados por _row_number
+                details.sort(key=lambda d: int(d.get("_row_number") or 0))
 
                 if not talon_interno or not talon_folio or not talon_seq:
                     continue
 
                 liq = _find_liquidacion_by_talon(int(client_id), talon_interno)
 
-                # Resolver campos “mínimos razonables” desde el primer renglón
                 first = details[0] if details else {}
                 fecha_dt = _parse_iso_date_to_date(first.get("fecha")) or date.today()
 
@@ -515,14 +530,14 @@ def import_liquidaciones_from_excel(
                 op2_id = _resolve_operator_id_from_excel(client_id, first.get("operador_2"))
                 car_id = _resolve_car_id_from_excel(client_id, first.get("carro"))
 
-                # Si tu tabla Liquidacion exige operator_id NOT NULL, esto debe resolverse.
-                # Si no se puede, lo marcamos como error “de viaje” y NO lo persistimos.
                 if not op1_id:
                     errors.append(
                         RowError(
                             row_number=int(first.get("_row_number") or 0),
-                            message=f"No se pudo resolver operator_id desde Excel (operador_1='{first.get('operador_1') or ''}'). "
-                                    f"Registra el operador en el catálogo o ajusta el texto del Excel.",
+                            message=(
+                                f"No se pudo resolver operator_id desde Excel (operador_1='{first.get('operador_1') or ''}'). "
+                                f"Registra el operador en el catálogo o ajusta el texto del Excel."
+                            ),
                             data={"talon_interno": talon_interno, "operador_1": first.get("operador_1")},
                         )
                     )
@@ -543,7 +558,6 @@ def import_liquidaciones_from_excel(
                         operator2_id=int(op2_id) if op2_id else None,
                         car_id=int(car_id) if car_id else None,
                         destination_id=None,
-                        # Campos numéricos básicos (no forzamos cálculos aquí)
                         kms=0,
                         tarifa=0,
                         aplica_iva=False,
@@ -558,8 +572,6 @@ def import_liquidaciones_from_excel(
                     created_liqs += 1
                     action = "created"
                 else:
-                    # Actualiza campos “snap” si estaban vacíos o si quieres sincronizar
-                    # (lo dejamos conservador para no pisar capturas manuales ya hechas).
                     if not getattr(liq, "fecha", None):
                         liq.fecha = fecha_dt
                     if not getattr(liq, "operator_id", None):
@@ -569,7 +581,6 @@ def import_liquidaciones_from_excel(
                     if car_id and not getattr(liq, "car_id", None):
                         liq.car_id = int(car_id)
 
-                    # Asegurar talón_folio/talon_seq consistentes
                     liq.talon_interno = talon_interno
                     liq.talon_folio = normalize_folio(talon_folio)
                     liq.talon_seq = int(talon_seq)
@@ -578,7 +589,6 @@ def import_liquidaciones_from_excel(
                     updated_liqs += 1
                     action = "updated"
 
-                # Reemplazar detalles del viaje (talón)
                 rep = _replace_detalles_for_liquidacion(
                     client_id=int(client_id),
                     liq=liq,
@@ -598,8 +608,7 @@ def import_liquidaciones_from_excel(
                     }
                 )
 
-            # 2) Actualizar contadores de series (talón) al máximo visto
-            updated_counters: List[Dict[str, Any]] = []
+            # Actualizar contadores de series (talón) al máximo visto
             for folio in folios:
                 max_seq = int(max_seq_by_folio.get(folio, 0) or 0)
                 if max_seq <= 0:
@@ -623,9 +632,6 @@ def import_liquidaciones_from_excel(
             db.session.rollback()
             raise ApiError(f"Error inesperado importando Excel: {e}", status_code=500)
 
-    else:
-        updated_counters = []
-
     # Resumen por folio
     summary_by_folio: List[Dict[str, Any]] = []
     for folio in folios:
@@ -638,11 +644,11 @@ def import_liquidaciones_from_excel(
             }
         )
 
+    # rows_out: siempre por orden del Excel
     rows_sorted = sorted(rows_out, key=lambda x: int(x.get("_row_number") or 0))
-    trips_sorted = sorted(
-        trips_map.values(),
-        key=lambda x: (str(x.get("talon_folio") or ""), int(x.get("talon_seq") or 0)),
-    )
+
+    # trips: por orden real de aparición en el Excel
+    trips_sorted = sorted(trips_map.values(), key=lambda x: int(x.get("first_row") or 0))
 
     return {
         "dry_run": dry_run,
@@ -658,7 +664,6 @@ def import_liquidaciones_from_excel(
         "errors": [{"row": e.row_number, "message": e.message, "data": e.data} for e in errors],
         "summary_by_folio": summary_by_folio,
         "updated_counters": updated_counters,
-        # Nuevo: resumen de persistencia para que el frontend/tu debug vea qué guardó
         "persist": {
             "created_liquidaciones": int(created_liqs),
             "updated_liquidaciones": int(updated_liqs),

@@ -30,6 +30,13 @@ def _parse_bool(v: Any) -> Optional[bool]:
     if isinstance(v, bool):
         return v
     s = str(v).strip().lower()
+
+    # soporta tu UI (modo)
+    if s in ("dry_run", "preview", "validate"):
+        return True
+    if s in ("import", "persist", "save", "commit"):
+        return False
+
     if s in ("1", "true", "t", "si", "s", "yes", "y"):
         return True
     if s in ("0", "false", "f", "no", "n"):
@@ -77,25 +84,30 @@ def import_excel(client_id: int):
       - Content-Type: multipart/form-data
       - file: campo "file" o "excel"
       - dry_run: query param o form field (opcional) => 1/0 (default: 1)
-
-    Response:
-      dict con:
-        dry_run, total_rows, folios, rows_out, trips, duplicates, errors,
-        summary_by_folio, updated_counters
+      - mode: query param o form field (opcional) => 'dry_run'|'import' (o aliases)
 
     Nota:
-      - Toda la lógica de negocio de talón, agrupación y contadores vive en el service.
+      - mode tiene prioridad sobre dry_run si viene.
+      - Por defecto: dry_run=True para evitar cambios accidentales.
     """
     _, err = _validate_client(client_id)
     if err:
         return err
 
+    # leer inputs (query tiene prioridad sobre form)
+    mode_raw = request.args.get("mode")
     dry_run_raw = request.args.get("dry_run")
+
+    if mode_raw is None:
+        mode_raw = request.form.get("mode")
     if dry_run_raw is None:
         dry_run_raw = request.form.get("dry_run")
 
-    dry_run = _parse_bool(dry_run_raw)
-    # Por defecto: dry_run=True (para evitar cambios accidentales)
+    # prioridad: mode si viene, si no dry_run
+    val = mode_raw if mode_raw is not None else dry_run_raw
+    dry_run = _parse_bool(val)
+
+    # default: True
     dry_run = True if dry_run is None else bool(dry_run)
 
     fs = _get_file_from_request()

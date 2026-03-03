@@ -984,36 +984,36 @@ def next_folio(client_id: int):
     return jsonify({"folio_num": int(nxt), "folio": Liquidacion.format_folio(int(nxt))})
 
 
-@liquidaciones_bp.post("/import-excel")
-def import_excel(client_id: int):
-    """
-    Importa/valida Excel de viajes por talón interno.
+# @liquidaciones_bp.post("/import-excel")
+# def import_excel(client_id: int):
+#     """
+#     Importa/valida Excel de viajes por talón interno.
 
-    - multipart/form-data con campo: file
-    - query param: dry_run=1 para solo validar (no persiste ni actualiza contadores)
-    """
-    _, err = _validate_client(client_id)
-    if err:
-        return err
+#     - multipart/form-data con campo: file
+#     - query param: dry_run=1 para solo validar (no persiste ni actualiza contadores)
+#     """
+#     _, err = _validate_client(client_id)
+#     if err:
+#         return err
 
-    dry_run = _parse_bool(request.args.get("dry_run"))
-    dry_run = bool(dry_run is True)
+#     dry_run = _parse_bool(request.args.get("dry_run"))
+#     dry_run = bool(dry_run is True)
 
-    f = request.files.get("file")
-    if not f:
-        return _err("Falta archivo (campo 'file').", 400)
+#     f = request.files.get("file")
+#     if not f:
+#         return _err("Falta archivo (campo 'file').", 400)
 
-    try:
-        result = import_liquidaciones_from_excel(
-            client_id=int(client_id),
-            file_storage=f,
-            dry_run=dry_run,
-        )
-        return jsonify(result), 200
-    except ApiError as e:
-        return _err(str(e), e.status_code or 400)
-    except Exception as e:
-        return _err(f"No se pudo importar el Excel. {str(e)}", 400)
+#     try:
+#         result = import_liquidaciones_from_excel(
+#             client_id=int(client_id),
+#             file_storage=f,
+#             dry_run=dry_run,
+#         )
+#         return jsonify(result), 200
+#     except ApiError as e:
+#         return _err(str(e), e.status_code or 400)
+#     except Exception as e:
+#         return _err(f"No se pudo importar el Excel. {str(e)}", 400)
 
 
 @liquidaciones_bp.route("/", methods=["GET"], strict_slashes=False)
