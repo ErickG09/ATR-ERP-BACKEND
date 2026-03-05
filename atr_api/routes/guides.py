@@ -1,7 +1,8 @@
 # atr_api/routes/guides.py
 from __future__ import annotations
 
-from typing import Any, Dict
+from decimal import Decimal
+from typing import Any, Dict, Tuple
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy.exc import IntegrityError
@@ -9,6 +10,8 @@ from sqlalchemy.exc import IntegrityError
 from atr_api.extensions import db
 from atr_api.errors import ApiError
 from atr_api.models import Guide, Operator, Car, Destination
+from atr_api.models.guide_convenio import GuideConvenio
+from atr_api.models.guide_factor import GuideFactor
 from atr_api.schemas.guide import sanitize_guide_payload, serialize_guide
 
 bp = Blueprint("guides", __name__)
@@ -64,6 +67,133 @@ def _bool_param(name: str) -> bool | None:
     if s in ("0", "false", "f", "no", "n"):
         return False
     return None
+
+
+# -----------------------------------------------------------------------------
+# Tarifa/kms auto (CONVENIO + FACTORES)
+# -----------------------------------------------------------------------------
+def _lookup_convenio(client_id: int, destination_codigo: str) -> GuideConvenio | None:
+    codigo = (destination_codigo or "").strip().upper()
+    if not codigo:
+        return None
+    return (
+        GuideConvenio.query.filter_by(client_id=client_id, destination_codigo=codigo, activo=True)
+        .limit(1)
+        .first()
+    )
+
+
+def _lookup_factor(client_id: int, carro: str, td: str, kms: int) -> GuideFactor | None:
+    carro = (carro or "").strip().upper()
+    td = (td or "").strip().upper()
+    return (
+        GuideFactor.query.filter_by(
+            client_id=client_id,
+            carro=carro,
+            td=td,
+            kms=int(kms),
+            activo=True,
+        )
+        .limit(1)
+        .first()
+    )
+
+
+def _should_try_autocalc(data: Dict[str, Any], partial: bool) -> bool:
+    """
+    Regla:
+      - Si el payload trae kms o tarifa explícitos => manual (NO autocalcular).
+      - Si NO trae kms ni tarifa => intentamos autocalcular (si hay destination + car_type).
+    En PATCH parcial, si no vienen, también podemos intentar autocalcular SOLO si cambió
+    destination_id/car_id/car_type (lo controlamos afuera).
+    """
+    if "kms" in data or "tarifa" in data:
+        return False
+    return True
+
+
+def _apply_destination_tax_defaults(dest: Destination, data: Dict[str, Any], *, partial: bool):
+    """
+    Si el usuario no envía flags/pcts, los tomamos del destinatario.
+    No pisamos valores explícitos del payload.
+    """
+    if "aplica_iva" not in data:
+        data["aplica_iva"] = bool(getattr(dest, "aplica_iva", False))
+    if "iva_pct" not in data:
+        data["iva_pct"] = float(getattr(dest, "iva_pct", 0) or 0)
+
+    if "aplica_retencion" not in data:
+        data["aplica_retencion"] = bool(getattr(dest, "aplica_retencion", False))
+    if "retencion_pct" not in data:
+        data["retencion_pct"] = float(getattr(dest, "retencion_pct", 0) or 0)
+
+
+def _recalc_amounts(data: Dict[str, Any], *, existing: Guide | None = None) -> Dict[str, Any]:
+    """
+    Recalcula subtotal/iva/retención/total usando:
+      - tarifa (obligatorio para cálculo; default 0)
+      - carros (si existe; default 0)
+      - aplica_iva + iva_pct
+      - aplica_retencion + retencion_pct
+
+    Nota: Aquí se asume que 'tarifa' representa un importe base por carro (muy común en tu UI legacy).
+          subtotal = tarifa * carros (si carros > 0), si no subtotal = tarifa.
+          Si en tu negocio 'tarifa' es total ya calculado, entonces carros=1 y funciona igual.
+    """
+    def _get_num(key: str, default: float = 0.0) -> Decimal:
+        if key in data:
+            return Decimal(str(data.get(key) or default))
+        if existing is not None:
+            return Decimal(str(getattr(existing, key, default) or default))
+        return Decimal(str(default))
+
+    def _get_bool(key: str, default: bool = False) -> bool:
+        if key in data:
+            return bool(data.get(key))
+        if existing is not None:
+            return bool(getattr(existing, key, default))
+        return bool(default)
+
+    tarifa = _get_num("tarifa", 0)
+    carros = Decimal(str(int(data.get("carros", getattr(existing, "carros", 0) if existing else 0) or 0)))
+
+    # subtotal base: tarifa * carros (si carros > 0), si no tarifa
+    if carros > 0:
+        subtotal = (tarifa * carros).quantize(Decimal("0.01"))
+    else:
+        subtotal = tarifa.quantize(Decimal("0.01"))
+
+    aplica_iva = _get_bool("aplica_iva", False)
+    iva_pct = _get_num("iva_pct", 0)
+    iva_monto = Decimal("0.00")
+    if aplica_iva and iva_pct > 0:
+        iva_monto = (subtotal * (iva_pct / Decimal("100"))).quantize(Decimal("0.01"))
+
+    aplica_ret = _get_bool("aplica_retencion", False)
+    ret_pct = _get_num("retencion_pct", 0)
+    ret_monto = Decimal("0.00")
+    if aplica_ret and ret_pct > 0:
+        ret_monto = (subtotal * (ret_pct / Decimal("100"))).quantize(Decimal("0.01"))
+
+    total = (subtotal + iva_monto - ret_monto).quantize(Decimal("0.01"))
+
+    data["subtotal"] = float(subtotal)
+    data["iva_monto"] = float(iva_monto)
+    data["retencion_monto"] = float(ret_monto)
+    data["total"] = float(total)
+    return data
+
+
+def _ensure_kms_tarifa_present_on_create(data: Dict[str, Any]):
+    """
+    Para CREATE: si no se pudo autocalcular, exigimos que el usuario mande kms+tarifa.
+    """
+    if data.get("kms") is None or data.get("tarifa") is None:
+        raise ApiError(
+            "No se pudo autocalcular (faltó CONVENIO/FACTOR). "
+            "Envía 'kms' y 'tarifa' manualmente para guardar la guía.",
+            status_code=400,
+        )
 
 
 @bp.get("/clients/<int:client_id>/guides")
@@ -129,24 +259,40 @@ def create_guide(client_id: int):
     data["client_id"] = client_id
 
     # --- Validaciones FK consistentes ---
-    # Operador global (solo debe existir)
     op = _get_operator_global(data["operator_id"])
 
-    # Destino sí es por cliente
+    dest_obj: Destination | None = None
     if data.get("destination_id") is not None:
-        _get_destination_by_client(client_id, data["destination_id"])
+        dest_obj = _get_destination_by_client(client_id, data["destination_id"])
+        _apply_destination_tax_defaults(dest_obj, data, partial=False)
 
     # Carro global + regla de consistencia tipo
     if data.get("car_id") is not None:
         car = _get_car_global(data["car_id"])
         car_ct = _enforce_operator_car_type_match(op, car)
-        # Fuerza car_type desde el carro (no confíes en front)
-        data["car_type"] = car_ct
+        data["car_type"] = car_ct  # fuerza car_type desde carro
     else:
-        # Si no hay carro, usa el tipo del operador (evita inconsistencias)
-        data["car_type"] = _normalize_ct(getattr(op, "tipo_carro", "")) or data.get(
-            "car_type", ""
-        )
+        data["car_type"] = _normalize_ct(getattr(op, "tipo_carro", "")) or data.get("car_type", "")
+
+    # --- Autocalcular kms/tarifa (si el payload NO trae kms/tarifa) ---
+    if _should_try_autocalc(data, partial=False) and dest_obj is not None:
+        convenio = _lookup_convenio(client_id, getattr(dest_obj, "codigo", ""))
+        if convenio:
+            factor = _lookup_factor(
+                client_id,
+                data.get("car_type", ""),
+                getattr(convenio, "td", ""),
+                int(getattr(convenio, "kms", 0) or 0),
+            )
+            if factor:
+                data["kms"] = int(getattr(convenio, "kms", 0) or 0)
+                data["tarifa"] = float(getattr(factor, "importe", 0) or 0)
+
+    # Si no se pudo autocalcular, exigimos manual para CREATE
+    _ensure_kms_tarifa_present_on_create(data)
+
+    # Recalcula montos siempre (manual o auto)
+    _recalc_amounts(data, existing=None)
 
     g = Guide(**data)
 
@@ -155,7 +301,6 @@ def create_guide(client_id: int):
         db.session.commit()
     except IntegrityError:
         db.session.rollback()
-        # uq_guide_client_folio
         raise ApiError("Ya existe una guía con ese folio para este cliente.", status_code=409)
 
     return jsonify(serialize_guide(g)), 201
@@ -167,7 +312,6 @@ def update_guide(client_id: int, guide_id: int):
     if not g:
         raise ApiError("Guía no encontrada.", status_code=404)
 
-    # Bloqueo simple: si ya está liquidada, no se edita
     if g.status == "liquidated":
         raise ApiError("La guía está liquidada y no puede modificarse.", status_code=409)
 
@@ -188,25 +332,35 @@ def update_guide(client_id: int, guide_id: int):
             raise ApiError("Ya existe otra guía con ese folio.", status_code=409)
 
     # --- Validaciones FK consistentes (global) ---
-    # Operador (si cambia)
     if "operator_id" in data and data["operator_id"] is not None:
         op = _get_operator_global(data["operator_id"])
     else:
         op = _get_operator_global(g.operator_id)
 
     # Destino (si cambia)
+    dest_obj: Destination | None = None
+    destination_changed = False
     if "destination_id" in data:
+        destination_changed = True
         if data["destination_id"] is not None:
-            _get_destination_by_client(client_id, data["destination_id"])
+            dest_obj = _get_destination_by_client(client_id, data["destination_id"])
+            _apply_destination_tax_defaults(dest_obj, data, partial=True)
+        else:
+            dest_obj = None
+    else:
+        # no cambió: usamos el actual si existe
+        if g.destination_id is not None:
+            dest_obj = _get_destination_by_client(client_id, g.destination_id)
 
     # Carro (si cambia)
+    car_changed = False
     if "car_id" in data:
+        car_changed = True
         if data["car_id"] is not None:
             car = _get_car_global(data["car_id"])
             car_ct = _enforce_operator_car_type_match(op, car)
-            data["car_type"] = car_ct  # fuerza tipo
+            data["car_type"] = car_ct
         else:
-            # quitar carro: opcional -> vuelve al tipo del operador
             data["car_type"] = _normalize_ct(getattr(op, "tipo_carro", "")) or g.car_type
     else:
         # Si no cambia carro pero sí cambió operador, revalidar coherencia con el carro actual
@@ -214,6 +368,47 @@ def update_guide(client_id: int, guide_id: int):
             car = _get_car_global(g.car_id)
             car_ct = _enforce_operator_car_type_match(op, car)
             data["car_type"] = car_ct
+
+    # --- Autocalcular kms/tarifa en PATCH SOLO si:
+    #     - no vienen kms/tarifa en payload (manual gana)
+    #     - y cambió destination/car/car_type (algo relevante)
+    # ---
+    if _should_try_autocalc(data, partial=True) and dest_obj is not None and (
+        destination_changed or car_changed or ("car_type" in data)
+    ):
+        convenio = _lookup_convenio(client_id, getattr(dest_obj, "codigo", ""))
+        if convenio:
+            ct = data.get("car_type") or g.car_type
+            factor = _lookup_factor(
+                client_id,
+                ct,
+                getattr(convenio, "td", ""),
+                int(getattr(convenio, "kms", 0) or 0),
+            )
+            if factor:
+                data["kms"] = int(getattr(convenio, "kms", 0) or 0)
+                data["tarifa"] = float(getattr(factor, "importe", 0) or 0)
+        # Si no encuentra, NO forzamos error en PATCH (para no romper edición).
+        # El usuario puede mandar kms/tarifa manuales en otra petición.
+
+    # Recalcula montos:
+    # - si viene tarifa/kms/carros o flags/pcts, recalculamos con data+existing
+    # - si no viene nada relacionado, no tocamos montos
+    touches_amounts = any(
+        k in data
+        for k in (
+            "tarifa",
+            "kms",
+            "carros",
+            "aplica_iva",
+            "iva_pct",
+            "aplica_retencion",
+            "retencion_pct",
+        )
+    ) or ("tarifa" in data) or ("kms" in data)
+
+    if touches_amounts:
+        _recalc_amounts(data, existing=g)
 
     for k, v in data.items():
         setattr(g, k, v)

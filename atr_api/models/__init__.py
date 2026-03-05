@@ -21,6 +21,9 @@ from .talon_series import TalonSeries
 from .operator_imss import OperatorIMSS
 from .liquidacion_detalle import LiquidacionDetalle
 
+from .guide_factor import GuideFactor
+from .guide_convenio import GuideConvenio
+
 __all__ = [
     "db",
     "Client",
@@ -38,4 +41,6 @@ __all__ = [
     "TalonSeries",
     "OperatorIMSS",
     "LiquidacionDetalle",
+    "GuideFactor",
+    "GuideConvenio"
 ]

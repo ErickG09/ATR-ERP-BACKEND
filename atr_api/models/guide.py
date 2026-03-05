@@ -50,6 +50,10 @@ class Guide(db.Model):
     # Tipo de carro usado para tarifas (ej: "CA", "FU", etc.)
     car_type = db.Column(db.String(10), nullable=False, server_default="")
 
+    # Cantidad de carros que trae el viaje (entero, sin decimales)
+    # Nota: en el sistema viejo "CARROS" aparece como número entero (ej. 10).
+    carros = db.Column(db.Integer, nullable=False, server_default="0")
+
     # Datos numéricos típicos para liquidación (ajusta a tu lógica)
     kms = db.Column(db.Numeric(12, 2), nullable=False, server_default="0")
     tarifa = db.Column(db.Numeric(12, 2), nullable=False, server_default="0")
@@ -76,6 +80,9 @@ class Guide(db.Model):
     __table_args__ = (
         db.UniqueConstraint("client_id", "folio", name="uq_guide_client_folio"),
         db.Index("ix_guides_client_operator_date", "client_id", "operator_id", "fecha"),
+        # Check constraint para evitar negativos (PostgreSQL lo soporta bien).
+        # Si usas SQLite/MySQL, también suele funcionar; si no, lo puedes quitar.
+        db.CheckConstraint("carros >= 0", name="ck_guides_carros_nonneg"),
     )
 
     def __repr__(self) -> str:

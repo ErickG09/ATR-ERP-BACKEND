@@ -19,6 +19,10 @@ def register_blueprints(app: Flask) -> None:
     from .talon_suggest import bp as talon_suggest_bp
     from .imss import bp as imss_bp
 
+    from .guides_convenio_import import bp as guides_convenio_import_bp
+    from .guides_factors_import import bp as guides_factors_import_bp
+    from .guides_quote import bp as guides_quote_bp
+
     app.register_blueprint(clients_bp, url_prefix="/api/clients")
 
     app.register_blueprint(operators_bp, url_prefix="/api")
@@ -41,4 +45,7 @@ def register_blueprints(app: Flask) -> None:
 
     app.register_blueprint(talon_suggest_bp)    
 
-    app.register_blueprint(imss_bp, url_prefix="/api")    
+    app.register_blueprint(imss_bp, url_prefix="/api")   
+    app.register_blueprint(guides_convenio_import_bp, url_prefix="/api") 
+    app.register_blueprint(guides_factors_import_bp, url_prefix="/api")
+    app.register_blueprint(guides_quote_bp, url_prefix="/api")

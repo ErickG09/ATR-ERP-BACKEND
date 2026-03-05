@@ -30,6 +30,40 @@ def _to_num(v: Any) -> float | None:
         return None
 
 
+def _to_int_strict(v: Any) -> int | None:
+    """
+    Convierte a int, rechazando flotantes y strings con decimales.
+    Acepta: 10, "10", " 10 "
+    Rechaza: 10.0, "10.0", "10,0", "10.5"
+    """
+    if v is None or v == "":
+        return None
+
+    # bool es subclass de int en Python: evítalo
+    if isinstance(v, bool):
+        return None
+
+    if isinstance(v, int):
+        return v
+
+    # float explícitamente no permitido (aunque sea .0)
+    if isinstance(v, float):
+        return None
+
+    s = str(v).strip()
+    if not s:
+        return None
+
+    # si trae separadores decimales, lo rechazamos
+    if "." in s or "," in s:
+        return None
+
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+
 def _to_date(v: Any) -> date | None:
     if v is None or v == "":
         return None
@@ -58,9 +92,16 @@ def sanitize_guide_payload(json_data: Dict[str, Any], partial: bool) -> Dict[str
         if not (json_data.get("folio") or "").strip():
             raise ApiError("El campo 'folio' es obligatorio.", status_code=400)
         if not (json_data.get("fecha") or "").strip():
-            raise ApiError("El campo 'fecha' (YYYY-MM-DD) es obligatorio.", status_code=400)
+            raise ApiError(
+                "El campo 'fecha' (YYYY-MM-DD) es obligatorio.", status_code=400
+            )
         if json_data.get("operator_id") in (None, ""):
             raise ApiError("El campo 'operator_id' es obligatorio.", status_code=400)
+
+        # 'carros' NO lo hago obligatorio para permitir flujo legacy/fallback.
+        # Si quieres hacerlo obligatorio, descomenta:
+        # if json_data.get("carros") in (None, ""):
+        #     raise ApiError("El campo 'carros' es obligatorio.", status_code=400)
 
     # folio
     if "folio" in json_data:
@@ -93,8 +134,31 @@ def sanitize_guide_payload(json_data: Dict[str, Any], partial: bool) -> Dict[str
     if "car_type" in json_data:
         data["car_type"] = str(json_data.get("car_type") or "").strip().upper()
 
+    # carros (entero estricto, no decimales)
+    if "carros" in json_data:
+        v = json_data.get("carros")
+        if v in (None, ""):
+            # Si prefieres forzar 0 cuando venga vacío, cámbialo a: data["carros"] = 0
+            data["carros"] = 0
+        else:
+            n = _to_int_strict(v)
+            if n is None:
+                raise ApiError("'carros' debe ser entero (sin decimales).", status_code=400)
+            if n < 0:
+                raise ApiError("'carros' debe ser >= 0.", status_code=400)
+            data["carros"] = n
+
     # numéricos
-    for k in ("kms", "tarifa", "subtotal", "iva_pct", "iva_monto", "retencion_pct", "retencion_monto", "total"):
+    for k in (
+        "kms",
+        "tarifa",
+        "subtotal",
+        "iva_pct",
+        "iva_monto",
+        "retencion_pct",
+        "retencion_monto",
+        "total",
+    ):
         if k in json_data:
             n = _to_num(json_data.get(k))
             if n is None:
@@ -136,6 +200,7 @@ def serialize_guide(g: Guide) -> Dict[str, Any]:
         "folio": g.folio,
         "fecha": g.fecha.isoformat() if g.fecha else None,
         "car_type": g.car_type,
+        "carros": int(getattr(g, "carros", 0) or 0),
         "kms": float(g.kms or 0),
         "tarifa": float(g.tarifa or 0),
         "subtotal": float(g.subtotal or 0),
