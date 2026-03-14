@@ -31,7 +31,7 @@ class Liquidacion(db.Model):
     talon_folio = db.Column(db.String(8), nullable=True)
 
     # Consecutivo numérico del talón (ej. 36, 12345678, 999999999999)
-    # ✅ BIGINT para soportar hasta 12 dígitos
+    #  BIGINT para soportar hasta 12 dígitos
     talon_seq = db.Column(db.BigInteger, nullable=True)
 
     fecha = db.Column(db.Date, nullable=False, default=date.today)
@@ -192,7 +192,7 @@ class Liquidacion(db.Model):
         # Validaciones mínimas de talón (permitimos NULL para legacy)
         CheckConstraint("talon_seq IS NULL OR talon_seq >= 1", name="ck_liq_talon_seq_valid"),
 
-        # ✅ máximo 12 dígitos (0..999,999,999,999; aquí >=1 por constraint anterior)
+        #  máximo 12 dígitos (0..999,999,999,999; aquí >=1 por constraint anterior)
         CheckConstraint(
             "talon_seq IS NULL OR talon_seq <= 999999999999",
             name="ck_liq_talon_seq_max_12d",
@@ -214,7 +214,7 @@ class Liquidacion(db.Model):
         Index("ix_liq_client_talon_folio_seq", "client_id", "talon_folio", "talon_seq"),
         Index("ix_liq_client_talon_folio", "client_id", "talon_folio"),
 
-        # ✅ Unicidad segura (Postgres) SOLO cuando no es NULL:
+        #  Unicidad segura (Postgres) SOLO cuando no es NULL:
         # Evita que la migración “reviente” por filas legacy con NULL.
         Index(
             "uq_liq_client_talon_interno_notnull",

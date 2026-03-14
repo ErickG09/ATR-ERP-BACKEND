@@ -18,7 +18,7 @@ class TalonSeries(db.Model):
       cliente_nombre = "VOLKS WAGEN PUEBLA"
       padding = 5  -> VWP00001
 
-    ✅ Ajuste: padding permitido hasta 12 (si decides generar con ceros),
+     Ajuste: padding permitido hasta 12 (si decides generar con ceros),
     pero esto NO obliga a mostrar 12 ceros: solo amplía el límite permitido.
     """
 
@@ -50,7 +50,7 @@ class TalonSeries(db.Model):
 
     __table_args__ = (
         UniqueConstraint("client_id", "folio", name="uq_talon_series_client_folio"),
-        # ✅ permitir hasta 12 (antes 10)
+        #  permitir hasta 12 (antes 10)
         CheckConstraint("padding >= 1 AND padding <= 12", name="ck_talon_series_padding"),
         Index("ix_talon_series_client_activo", "client_id", "activo"),
         Index("ix_talon_series_client_folio", "client_id", "folio"),
