@@ -1,7 +1,7 @@
 # atr_api/models/liquidacion.py
 from __future__ import annotations
 
-from datetime import datetime, date
+from datetime import date, datetime
 
 from sqlalchemy import CheckConstraint, Index, UniqueConstraint
 
@@ -21,17 +21,10 @@ class Liquidacion(db.Model):
     folio = db.Column(db.String(32), nullable=False)
 
     # -------------------------
-    # Talón interno (nuevo flujo)
+    # Talón interno
     # -------------------------
-    # Display final (ej. ESP00036 / VWP12345678 / VWP36, etc.)
-    # Se recomienda guardar TAL CUAL lo capture el usuario en la lógica de tus endpoints/services.
     talon_interno = db.Column(db.String(64), nullable=True)
-
-    # Prefijo/folio del talón (ej. "ESP") para consultas y orden
     talon_folio = db.Column(db.String(8), nullable=True)
-
-    # Consecutivo numérico del talón (ej. 36, 12345678, 999999999999)
-    #  BIGINT para soportar hasta 12 dígitos
     talon_seq = db.Column(db.BigInteger, nullable=True)
 
     fecha = db.Column(db.Date, nullable=False, default=date.today)
@@ -39,7 +32,9 @@ class Liquidacion(db.Model):
     # Fecha usada para determinar qué mes/año IMSS aplicar
     imss_fecha = db.Column(db.Date, nullable=True)
 
-    # Operadores
+    # -------------------------
+    # Relaciones base
+    # -------------------------
     operator_id = db.Column(db.Integer, db.ForeignKey("operators.id"), nullable=False)
     operator2_id = db.Column(db.Integer, db.ForeignKey("operators.id"), nullable=True)
 
@@ -48,11 +43,28 @@ class Liquidacion(db.Model):
 
     car_type = db.Column(db.String(8), nullable=True)
 
-    # Captura base (la conservamos)
+    # -------------------------
+    # Snapshot del viaje resuelto
+    # Se llena desde la lógica de backend al momento de crear/actualizar liquidación.
+    # Esto evita recalcular el histórico si cambian convenio / operador / destino después.
+    # -------------------------
+    trip_td = db.Column(db.String(10), nullable=True)                  # Ej: P, L, M, E, ET, EL, I, IM, IV, PA, RE
+    trip_type_label = db.Column(db.String(40), nullable=True)          # Ej: PROVINCIA, LOCAL, D.F., EXPORTACION, etc.
+    trip_rule_applied = db.Column(db.String(40), nullable=True)        # Ej: provincia_factor, provincia_viaje_especial, local_fijo
+    trip_destination_codigo = db.Column(db.String(20), nullable=True)  # Snapshot de Destination.codigo
+    trip_destination_nombre = db.Column(db.String(180), nullable=True) # Snapshot de Destination.nombre
+    trip_kms_convenio = db.Column(db.Integer, nullable=True)           # KMS sugeridos por convenio
+
+    # Esquema de pago aplicado por operador
+    pago_scheme_op1 = db.Column(db.String(32), nullable=True)          # Ej: fijo_td, provincia_factor, viaje_especial
+    pago_scheme_op2 = db.Column(db.String(32), nullable=True)
+
+    # -------------------------
+    # Captura base comercial
+    # -------------------------
     kms = db.Column(db.Numeric(12, 2), nullable=False, default=0)
     tarifa = db.Column(db.Numeric(14, 4), nullable=False, default=0)
 
-    # Cálculos “fiscales/comerciales” (conservados)
     subtotal = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
     aplica_iva = db.Column(db.Boolean, nullable=False, default=False)
@@ -66,7 +78,8 @@ class Liquidacion(db.Model):
     total = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
     # -------------------------
-    # snapshots para cálculo por viaje
+    # Snapshots de pago por operador
+    # Aquí se guarda ya el resultado resuelto por la lógica de liquidación.
     # -------------------------
     sueldo_base_op1 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     viaticos_base_op1 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
@@ -74,7 +87,6 @@ class Liquidacion(db.Model):
     sueldo_base_op2 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     viaticos_base_op2 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
-    # “maniobra y todo eso” (por operador, editable por liquidación)
     maniobra_op1 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     maniobra_op2 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
@@ -82,14 +94,13 @@ class Liquidacion(db.Model):
     otros_ingresos_op2 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
     # -------------------------
-    # GASTOS capturados (base SIN IVA - Opción A)
+    # GASTOS capturados (base SIN IVA)
     # -------------------------
     gasto_autopistas = db.Column(db.Numeric(14, 2), nullable=True, default=0)
     gasto_rep_menores = db.Column(db.Numeric(14, 2), nullable=True, default=0)
     gasto_otros_c_comp = db.Column(db.Numeric(14, 2), nullable=True, default=0)
     gasto_ayudas = db.Column(db.Numeric(14, 2), nullable=True, default=0)
 
-    # Gastos de viaje (catálogo)
     gasto_dias_taller = db.Column(db.Numeric(14, 2), nullable=True, default=0)
     gasto_estancias = db.Column(db.Numeric(14, 2), nullable=True, default=0)
     gasto_gasolina = db.Column(db.Numeric(14, 2), nullable=True, default=0)
@@ -101,7 +112,9 @@ class Liquidacion(db.Model):
     gasto_taxis = db.Column(db.Numeric(14, 2), nullable=True, default=0)
     gasto_transitos = db.Column(db.Numeric(14, 2), nullable=True, default=0)
 
-    # ---- Con IVA (según tu catálogo)
+    # -------------------------
+    # Gastos con IVA
+    # -------------------------
     gasto_aceites = db.Column(db.Numeric(14, 2), nullable=True, default=0)
     gasto_diesel = db.Column(db.Numeric(14, 2), nullable=True, default=0)
     gasto_estacionamiento = db.Column(db.Numeric(14, 2), nullable=True, default=0)
@@ -110,7 +123,7 @@ class Liquidacion(db.Model):
     gasto_urea = db.Column(db.Numeric(14, 2), nullable=True, default=0)
 
     # -------------------------
-    # IVA % por concepto con IVA (Opción A)
+    # IVA % por concepto con IVA
     # -------------------------
     gasto_aceites_iva_pct = db.Column(db.Numeric(6, 2), nullable=False, default=16)
     gasto_diesel_iva_pct = db.Column(db.Numeric(6, 2), nullable=False, default=16)
@@ -137,7 +150,7 @@ class Liquidacion(db.Model):
     pago_final_op1 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     pago_final_op2 = db.Column(db.Numeric(14, 2), nullable=False, default=0)
 
-    # Compatibilidad (totales agregados)
+    # Compatibilidad
     deducciones_total = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     neto_operador = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     pago_final_total = db.Column(db.Numeric(14, 2), nullable=False, default=0)
@@ -155,7 +168,6 @@ class Liquidacion(db.Model):
     # -------------------------
     # Relaciones
     # -------------------------
-    # Detalles del viaje (1 talón = 1 liquidación, N renglones)
     detalles = db.relationship(
         "LiquidacionDetalle",
         backref="liquidacion",
@@ -189,33 +201,32 @@ class Liquidacion(db.Model):
 
         CheckConstraint(f"status IN {LIQ_STATUS_CHOICES}", name="ck_liq_status_valid"),
 
-        # Validaciones mínimas de talón (permitimos NULL para legacy)
         CheckConstraint("talon_seq IS NULL OR talon_seq >= 1", name="ck_liq_talon_seq_valid"),
-
-        #  máximo 12 dígitos (0..999,999,999,999; aquí >=1 por constraint anterior)
         CheckConstraint(
             "talon_seq IS NULL OR talon_seq <= 999999999999",
             name="ck_liq_talon_seq_max_12d",
         ),
-
         CheckConstraint(
             "talon_folio IS NULL OR length(talon_folio) BETWEEN 2 AND 8",
             name="ck_liq_talon_folio_len",
         ),
 
+        CheckConstraint(
+            "trip_kms_convenio IS NULL OR trip_kms_convenio >= 0",
+            name="ck_liq_trip_kms_convenio_nonneg",
+        ),
+
         Index("ix_liq_client_fecha", "client_id", "fecha"),
         Index("ix_liq_client_status", "client_id", "status"),
         Index("ix_liq_client_activo", "client_id", "activo"),
-
-        # mantenemos índice por compatibilidad y búsquedas
         Index("ix_liq_client_talon", "client_id", "talon_interno"),
-
-        # Índices para sugerencias/orden rápidas por serie
         Index("ix_liq_client_talon_folio_seq", "client_id", "talon_folio", "talon_seq"),
         Index("ix_liq_client_talon_folio", "client_id", "talon_folio"),
 
-        #  Unicidad segura (Postgres) SOLO cuando no es NULL:
-        # Evita que la migración “reviente” por filas legacy con NULL.
+        # Índices nuevos para trazabilidad del viaje resuelto
+        Index("ix_liq_client_trip_td", "client_id", "trip_td"),
+        Index("ix_liq_client_trip_dest_codigo", "client_id", "trip_destination_codigo"),
+
         Index(
             "uq_liq_client_talon_interno_notnull",
             "client_id",
@@ -233,9 +244,6 @@ class Liquidacion(db.Model):
         ),
     )
 
-    # -------------------------
-    # Helpers IVA gastos (Opción A)
-    # -------------------------
     IVA_GASTOS_KEYS = (
         "gasto_aceites",
         "gasto_diesel",
@@ -254,6 +262,7 @@ class Liquidacion(db.Model):
             base = float(getattr(self, key, 0) or 0)
             pct = float(getattr(self, f"{key}_iva_pct", 0) or 0)
             pct = max(0.0, min(100.0, pct))
+
             iva = round(base * (pct / 100.0), 2) if base > 0 and pct > 0 else 0.0
             tot = round(base + iva, 2)
 
@@ -273,8 +282,56 @@ class Liquidacion(db.Model):
             "total_con_iva": round(total_con_iva, 2),
         }
 
+    def _gross_for_slot(self, slot: int) -> float:
+        if slot == 1:
+            return (
+                float(self.sueldo_base_op1 or 0)
+                + float(self.viaticos_base_op1 or 0)
+                + float(self.maniobra_op1 or 0)
+                + float(self.otros_ingresos_op1 or 0)
+            )
+
+        return (
+            float(self.sueldo_base_op2 or 0)
+            + float(self.viaticos_base_op2 or 0)
+            + float(self.maniobra_op2 or 0)
+            + float(self.otros_ingresos_op2 or 0)
+        )
+
+    def _ensure_tax_ded(self, slot: int, amount: float) -> None:
+        if slot == 2 and not self.operator2_id:
+            self.deducciones = [
+                d
+                for d in (self.deducciones or [])
+                if not (d.key == "impuestos" and int(getattr(d, "operator_slot", 1) or 1) == 2)
+            ]
+            return
+
+        found = None
+        for d in (self.deducciones or []):
+            if d.key == "impuestos" and int(getattr(d, "operator_slot", 1) or 1) == slot:
+                found = d
+                break
+
+        if found is None:
+            from atr_api.models.liquidacion_deduccion import LiquidacionDeduccion
+
+            self.deducciones.append(
+                LiquidacionDeduccion(
+                    operator_slot=slot,
+                    key="impuestos",
+                    label="Impuestos",
+                    monto=amount,
+                )
+            )
+        else:
+            found.label = "Impuestos"
+            found.monto = amount
+
     def recalc_totals(self):
-        # 1) totales “fiscales/comerciales” existentes (conservamos)
+        # ---------------------------------
+        # 1) Totales comerciales/fiscales
+        # ---------------------------------
         kms = float(self.kms or 0)
         tarifa = float(self.tarifa or 0)
         subtotal = kms * tarifa
@@ -284,7 +341,6 @@ class Liquidacion(db.Model):
 
         iva_monto = subtotal * (iva_pct / 100.0) if self.aplica_iva else 0.0
         ret_monto = subtotal * (ret_pct / 100.0) if self.aplica_retencion else 0.0
-
         total = subtotal + iva_monto - ret_monto
 
         self.subtotal = round(subtotal, 2)
@@ -292,24 +348,11 @@ class Liquidacion(db.Model):
         self.retencion_monto = round(ret_monto, 2)
         self.total = round(total, 2)
 
-        # 2) cálculo por operador: base + impuestos(6%) + deducciones + anticipos
-        def _gross(slot: int) -> float:
-            if slot == 1:
-                return (
-                    float(self.sueldo_base_op1 or 0)
-                    + float(self.viaticos_base_op1 or 0)
-                    + float(self.maniobra_op1 or 0)
-                    + float(self.otros_ingresos_op1 or 0)
-                )
-            return (
-                float(self.sueldo_base_op2 or 0)
-                + float(self.viaticos_base_op2 or 0)
-                + float(self.maniobra_op2 or 0)
-                + float(self.otros_ingresos_op2 or 0)
-            )
-
-        gross1 = _gross(1)
-        gross2 = _gross(2) if self.operator2_id else 0.0
+        # ---------------------------------
+        # 2) Cálculo por operador
+        # ---------------------------------
+        gross1 = self._gross_for_slot(1)
+        gross2 = self._gross_for_slot(2) if self.operator2_id else 0.0
 
         imp1 = round(gross1 * 0.06, 2)
         imp2 = round(gross2 * 0.06, 2) if self.operator2_id else 0.0
@@ -317,60 +360,28 @@ class Liquidacion(db.Model):
         self.impuestos_op1 = imp1
         self.impuestos_op2 = imp2
 
-        # 2a) “upsert” deducción impuestos por slot
-        def _ensure_tax_ded(slot: int, amount: float):
-            if slot == 2 and not self.operator2_id:
-                self.deducciones = [
-                    d
-                    for d in (self.deducciones or [])
-                    if not (d.key == "impuestos" and int(getattr(d, "operator_slot", 1)) == 2)
-                ]
-                return
+        self._ensure_tax_ded(1, imp1)
+        self._ensure_tax_ded(2, imp2)
 
-            found = None
-            for d in (self.deducciones or []):
-                if d.key == "impuestos" and int(getattr(d, "operator_slot", 1)) == slot:
-                    found = d
-                    break
-            if found is None:
-                from atr_api.models.liquidacion_deduccion import LiquidacionDeduccion
-
-                self.deducciones.append(
-                    LiquidacionDeduccion(
-                        operator_slot=slot,
-                        key="impuestos",
-                        label="Impuestos",
-                        monto=amount,
-                    )
-                )
-            else:
-                found.label = "Impuestos"
-                found.monto = amount
-
-        _ensure_tax_ded(1, imp1)
-        _ensure_tax_ded(2, imp2)
-
-        # 2b) sumar deducciones por slot
         ded1 = 0.0
         ded2 = 0.0
         for d in (self.deducciones or []):
             slot = int(getattr(d, "operator_slot", 1) or 1)
-            m = float(getattr(d, "monto", 0) or 0)
+            monto = float(getattr(d, "monto", 0) or 0)
             if slot == 1:
-                ded1 += m
+                ded1 += monto
             elif slot == 2:
-                ded2 += m
+                ded2 += monto
 
-        # 2c) sumar anticipos por slot
         ant1 = 0.0
         ant2 = 0.0
         for a in (self.anticipos or []):
             slot = int(getattr(a, "operator_slot", 1) or 1)
-            m = float(getattr(a, "importe", 0) or 0)
+            monto = float(getattr(a, "importe", 0) or 0)
             if slot == 1:
-                ant1 += m
+                ant1 += monto
             elif slot == 2:
-                ant2 += m
+                ant2 += monto
 
         net1 = round(gross1 - ded1, 2)
         net2 = round(gross2 - ded2, 2)
@@ -390,7 +401,6 @@ class Liquidacion(db.Model):
         self.pago_final_op1 = pay1
         self.pago_final_op2 = pay2
 
-        # agregados (compatibilidad)
         self.deducciones_total = round(ded1 + ded2, 2)
         self.neto_operador = round(net1 + net2, 2)
         self.pago_final_total = round(pay1 + pay2, 2)

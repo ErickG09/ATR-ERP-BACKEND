@@ -18,20 +18,20 @@ from atr_api.models.client import Client
 from atr_api.models.client_counter import ClientCounter
 from atr_api.models.destination import Destination
 from atr_api.models.deducciones_config import ClientDeduccionesConfig
+from atr_api.models.guide import Guide
+from atr_api.models.guide_convenio import GuideConvenio
 from atr_api.models.liquidacion import LIQ_STATUS_CHOICES, Liquidacion
 from atr_api.models.liquidacion_anticipo import LiquidacionAnticipo
 from atr_api.models.liquidacion_deduccion import LiquidacionDeduccion
 from atr_api.models.operator import Operator
 from atr_api.models.operator_deduccion_extra import OperatorDeduccionExtra
-from atr_api.models.operator_imss import OperatorIMSS  # IMSS mensual
+from atr_api.models.operator_imss import OperatorIMSS
 from atr_api.models.talon_series import TalonSeries
 from atr_api.models.talon_series_counter import TalonSeriesCounter
-
-from atr_api.services.liquidaciones_excel_import_service import import_liquidaciones_from_excel
 from atr_api.services.talon_service import (
     format_talon,
     normalize_folio,
-    normalize_manual_talon_with_catalog,  # NO fuerza padding (talón manual)
+    normalize_manual_talon_with_catalog,
 )
 
 liquidaciones_bp = Blueprint(
@@ -40,11 +40,10 @@ liquidaciones_bp = Blueprint(
     url_prefix="/api/clients/<int:client_id>/liquidaciones",
 )
 
-# ---------------- helpers ----------------
+# -----------------------------------------------------------------------------
+# Reglas / catálogos internos
+# -----------------------------------------------------------------------------
 
-# keys predefinidas (las “fijas” que tendrás en UI)
-# NOTA: "impuestos" se calcula automáticamente (6%) y el backend lo "upsertea".
-# NOTA 2: IMSS NO es PRESET. IMSS se inserta automáticamente desde OperatorIMSS (mensual).
 PRESET_DED_KEYS = {
     "ayuda_escolar": "Ayuda escolar",
     "impuestos": "Impuestos",
@@ -54,17 +53,11 @@ PRESET_DED_KEYS = {
     "pension_alimenticia": "Pensión alimenticia",
 }
 
-# keys “fijas” que sí guardamos como renglón (impuestos NO: se recalcula en recalc_totals)
 PRESET_KEYS_NO_TAX = [k for k in PRESET_DED_KEYS.keys() if k != "impuestos"]
 
-# prefijos de keys para identificar deducciones generadas por config
-CFG_EXTRA_KEY_PREFIX = "cfg_extra:"  # extras globales/override guardados en config
-OP_EXTRA_KEY_PREFIX = "op_extra:"  # pagos aplicados a “deudas” del operador (tabla OperatorDeduccionExtra)
+CFG_EXTRA_KEY_PREFIX = "cfg_extra:"
+OP_EXTRA_KEY_PREFIX = "op_extra:"
 
-# -------------------------
-# Campos de gastos (opcionales) para guardar lo capturado en el frontend.
-# Deben existir como columnas en atr_api/models/liquidacion.py
-# -------------------------
 EXPENSE_FIELDS = [
     "gasto_autopistas",
     "gasto_rep_menores",
@@ -88,7 +81,6 @@ EXPENSE_FIELDS = [
     "gasto_urea",
 ]
 
-# IVA % por gasto que aplica IVA
 EXPENSE_IVA_PCT_FIELDS = [
     "gasto_aceites_iva_pct",
     "gasto_diesel_iva_pct",
@@ -98,6 +90,79 @@ EXPENSE_IVA_PCT_FIELDS = [
     "gasto_urea_iva_pct",
 ]
 
+# -----------------------------------------------------------------------------
+# Mapeo TD -> etiqueta
+# -----------------------------------------------------------------------------
+
+TRIP_TYPE_LABELS: Dict[str, str] = {
+    "P": "PROVINCIA",
+    "L": "LOCAL",
+    "M": "D.F.",
+    "E": "EXPORTACION",
+    "ET": "EXPORTACION TUXPAN",
+    "EL": "EXPORTACION LAZARO",
+    "I": "IMPORTACION",
+    "IM": "IMPORTACION MERCATUS",
+    "IV": "IMPORTADO VACIO",
+    "PA": "PATIO",
+    "RE": "RESGUARDO",
+}
+
+# -----------------------------------------------------------------------------
+# Mapeo TD -> columna fija de sueldo en Operator
+# Regla:
+# - P no entra aquí, porque PROVINCIA usa regla especial
+# - los demás usan pago fijo por tipo
+# -----------------------------------------------------------------------------
+
+TD_TO_OPERATOR_PAY_FIELD: Dict[str, str] = {
+    "L": "local",
+    "M": "mexico",
+    "E": "exp_ver",
+    "ET": "exp_tux",
+    "EL": "exp_lc",
+    "I": "importado",
+    "IM": "importado",
+    "IV": "importado",
+    "PA": "patios",
+    "RE": "resguardo",
+}
+
+# -----------------------------------------------------------------------------
+# Mapeo TD -> columna de maniobra en Operator
+# Nota:
+# Este mapeo queda centralizado para que puedas ajustarlo si ATR confirma
+# alguna equivalencia distinta.
+# -----------------------------------------------------------------------------
+
+TD_TO_OPERATOR_MANIOBRA_FIELD: Dict[str, str] = {
+    "L": "man_esp",
+    "M": "man_df",
+    "E": "man_ver",
+    "ET": "man_ver",
+    "EL": "man_salamanca_lzc",
+    "I": "man_esp",
+    "IM": "man_esp",
+    "IV": "man_esp",
+    "PA": "man_esp",
+    "RE": "man_esp",
+}
+
+PROVINCIA_FACTOR_MANIOBRA_FIELD = "man_nac"
+PROVINCIA_SPECIAL_MANIOBRA_FIELD = "man_esp"
+
+TRIP_RULE_PROVINCIA_FACTOR = "provincia_factor"
+TRIP_RULE_PROVINCIA_SPECIAL = "provincia_viaje_especial"
+TRIP_RULE_FIXED_TD = "fijo_td"
+
+PAGO_SCHEME_FIXED = "fijo_td"
+PAGO_SCHEME_PROV_FACTOR = "provincia_factor"
+PAGO_SCHEME_SPECIAL = "viaje_especial"
+
+
+# -----------------------------------------------------------------------------
+# Helpers generales
+# -----------------------------------------------------------------------------
 
 def _err(msg: str, code: int = 400):
     return jsonify({"error": msg}), code
@@ -139,6 +204,10 @@ def _num(v, default=0.0):
         return default
 
 
+def _round2(v: Any) -> float:
+    return round(float(_num(v, 0.0)), 2)
+
+
 def _validate_client(client_id: int):
     c = db.session.get(Client, client_id)
     if not c:
@@ -168,10 +237,6 @@ def _get_destination_by_client(client_id: int, destination_id: int) -> Destinati
 
 
 def _enforce_operator_car_type_match(op: Operator, car: Car) -> str:
-    """
-    Regla CLAVE: El tipo del operador (tipo_carro) debe coincidir con el tipo del carro (tipo).
-    Si falta alguno, fallamos para no guardar inconsistencias.
-    """
     op_ct = _normalize_ct(getattr(op, "tipo_carro", ""))
     car_ct = _normalize_ct(getattr(car, "tipo", ""))
 
@@ -188,11 +253,6 @@ def _enforce_operator_car_type_match(op: Operator, car: Car) -> str:
 
 
 def _derive_car_type(op: Operator, car: Car | None) -> str:
-    """
-    Define el car_type final:
-    - Si hay carro: viene del carro (pero validado contra operador)
-    - Si no hay carro: viene del operador
-    """
     if car is not None:
         return _enforce_operator_car_type_match(op, car)
 
@@ -203,11 +263,6 @@ def _derive_car_type(op: Operator, car: Car | None) -> str:
 
 
 def _validate_fk_belongs(client_id: int, operator_id: int, car_id, destination_id):
-    """
-    Operador y Carro: globales (solo existen).
-    Destino: pertenece al cliente.
-    Además calcula car_type_final de forma consistente.
-    """
     try:
         op = _get_operator_global(operator_id)
 
@@ -247,9 +302,6 @@ def _validate_operator_slot(v) -> int:
 
 
 def _validate_deduccion_payload(item: dict, allow_id: bool = False):
-    """
-    Retorna (ded_id, slot, key, label, monto) con validaciones estrictas.
-    """
     if not isinstance(item, dict):
         raise ApiError("Deducción inválida (debe ser objeto).", status_code=400)
 
@@ -261,7 +313,6 @@ def _validate_deduccion_payload(item: dict, allow_id: bool = False):
             raise ApiError("Deducción id inválido.", status_code=400)
 
     slot = _validate_operator_slot(item.get("operator_slot", 1))
-
     key = _norm_key(item.get("key"))
     label = (item.get("label") or "").strip()
 
@@ -270,14 +321,12 @@ def _validate_deduccion_payload(item: dict, allow_id: bool = False):
 
     if not label:
         raise ApiError("Deducción requiere 'label'.", status_code=400)
-
     if len(label) > 120:
         raise ApiError("Deducción 'label' demasiado largo (máx 120).", status_code=400)
 
     monto = _num(item.get("monto"), None)
     if monto is None or not isinstance(monto, (int, float)):
         raise ApiError("Deducción 'monto' inválido.", status_code=400)
-
     if monto < 0:
         raise ApiError("Deducción 'monto' no puede ser negativa.", status_code=400)
 
@@ -285,9 +334,6 @@ def _validate_deduccion_payload(item: dict, allow_id: bool = False):
 
 
 def _validate_anticipo_payload(item: dict):
-    """
-    Retorna (slot, importe, recibo) con validaciones estrictas.
-    """
     if not isinstance(item, dict):
         raise ApiError("Anticipo inválido (debe ser objeto).", status_code=400)
 
@@ -306,14 +352,311 @@ def _validate_anticipo_payload(item: dict):
     return slot, round(float(importe), 2), recibo
 
 
-# -------------------------
-# TALÓN INTERNO (SERIE + CONTADOR)
-# -------------------------
+# -----------------------------------------------------------------------------
+# Helpers de resolución de viaje / pago
+# -----------------------------------------------------------------------------
+
+def _validate_guide_ids_payload(raw_guide_ids: Any) -> List[int]:
+    if raw_guide_ids in (None, ""):
+        return []
+
+    if not isinstance(raw_guide_ids, list):
+        raise ApiError("guide_ids debe ser una lista.", status_code=400)
+
+    out: List[int] = []
+    seen = set()
+
+    for x in raw_guide_ids:
+        try:
+            gid = int(x)
+        except Exception:
+            raise ApiError("guide_ids contiene un valor inválido.", status_code=400)
+
+        if gid <= 0:
+            raise ApiError("guide_ids contiene un id inválido.", status_code=400)
+
+        if gid in seen:
+            continue
+        seen.add(gid)
+        out.append(gid)
+
+    return out
+
+
+def _get_guides_for_client(client_id: int, guide_ids: List[int]) -> List[Guide]:
+    if not guide_ids:
+        return []
+
+    rows = (
+        db.session.query(Guide)
+        .filter(
+            Guide.client_id == int(client_id),
+            Guide.id.in_(guide_ids),
+        )
+        .all()
+    )
+
+    if len(rows) != len(guide_ids):
+        found_ids = {int(g.id) for g in rows}
+        missing = [gid for gid in guide_ids if gid not in found_ids]
+        raise ApiError(
+            f"Se encontraron guide_ids inválidos para este cliente: {missing}.",
+            status_code=400,
+        )
+
+    return rows
+
+
+def _resolve_destination_for_liquidacion(
+    client_id: int,
+    explicit_destination_id: int | None,
+    guide_ids: List[int],
+) -> Destination:
+    if explicit_destination_id is not None:
+        return _get_destination_by_client(client_id, explicit_destination_id)
+
+    guides = _get_guides_for_client(client_id, guide_ids)
+    if not guides:
+        raise ApiError(
+            "No se pudo resolver el destino final. Envía destination_id o guide_ids válidos.",
+            status_code=400,
+        )
+
+    destination_ids = {
+        int(g.destination_id)
+        for g in guides
+        if getattr(g, "destination_id", None) is not None
+    }
+
+    if not destination_ids:
+        raise ApiError(
+            "Las guías seleccionadas no tienen destination_id. No se puede resolver el tipo de viaje.",
+            status_code=400,
+        )
+
+    if len(destination_ids) > 1:
+        raise ApiError(
+            "Las guías seleccionadas apuntan a más de un destino. Define un destination_id único para liquidar.",
+            status_code=400,
+        )
+
+    resolved_id = next(iter(destination_ids))
+    return _get_destination_by_client(client_id, resolved_id)
+
+
+def _lookup_convenio(client_id: int, destination_codigo: str) -> GuideConvenio | None:
+    codigo = _normalize_ct(destination_codigo)
+    if not codigo:
+        return None
+
+    return (
+        db.session.query(GuideConvenio)
+        .filter(
+            GuideConvenio.client_id == int(client_id),
+            GuideConvenio.destination_codigo == codigo,
+            GuideConvenio.activo.is_(True),
+        )
+        .limit(1)
+        .one_or_none()
+    )
+
+
+def _extract_kms_recorridos_from_payload(
+    body: Dict[str, Any],
+    default_kms: int | None = None,
+) -> float:
+    if "kms_recorridos" in body:
+        kms = _num(body.get("kms_recorridos"), 0.0)
+        return max(0.0, kms)
+
+    if "kms" in body:
+        kms = _num(body.get("kms"), 0.0)
+        return max(0.0, kms)
+
+    has_kms_sal = "kms_sal" in body
+    has_kms_reg = "kms_reg" in body
+
+    if has_kms_sal and has_kms_reg:
+        kms_sal = _num(body.get("kms_sal"), 0.0)
+        kms_reg = _num(body.get("kms_reg"), 0.0)
+        return max(0.0, kms_reg - kms_sal)
+
+    if has_kms_reg:
+        return max(0.0, _num(body.get("kms_reg"), 0.0))
+
+    return float(default_kms or 0)
+
+
+def _operator_money(op: Operator | None, field_name: str) -> float:
+    if op is None:
+        return 0.0
+    return round(float(getattr(op, field_name, 0) or 0.0), 2)
+
+
+def _build_trip_label(td: str | None) -> str | None:
+    td_n = _normalize_ct(td)
+    if not td_n:
+        return None
+    return TRIP_TYPE_LABELS.get(td_n, td_n)
+
+
+def _resolve_fixed_trip_payment_for_operator(
+    op: Operator | None,
+    td: str,
+) -> Dict[str, Any]:
+    td_n = _normalize_ct(td)
+    pay_field = TD_TO_OPERATOR_PAY_FIELD.get(td_n)
+    maniobra_field = TD_TO_OPERATOR_MANIOBRA_FIELD.get(td_n)
+
+    if not pay_field:
+        raise ApiError(
+            f"No existe mapeo de pago fijo para el tipo de viaje '{td_n}'.",
+            status_code=400,
+        )
+
+    sueldo = _operator_money(op, pay_field)
+    maniobra = _operator_money(op, maniobra_field) if maniobra_field else 0.0
+
+    return {
+        "scheme": PAGO_SCHEME_FIXED,
+        "sueldo": sueldo,
+        "viaticos": 0.0,
+        "maniobra": maniobra,
+    }
+
+
+def _resolve_provincia_payment_for_operator(
+    op: Operator | None,
+    kms_recorridos: float,
+) -> Dict[str, Any]:
+    kms = max(0.0, float(kms_recorridos or 0.0))
+
+    if kms > 1000:
+        sueldo_por_km = float(getattr(op, "sueldo_por_km", 0) or 0.0) if op else 0.0
+        viaticos_por_km = float(getattr(op, "viaticos_por_km", 0) or 0.0) if op else 0.0
+
+        sueldo = round(sueldo_por_km * kms, 2)
+        viaticos = round(viaticos_por_km * kms, 2)
+        maniobra = _operator_money(op, PROVINCIA_FACTOR_MANIOBRA_FIELD)
+
+        return {
+            "scheme": PAGO_SCHEME_PROV_FACTOR,
+            "sueldo": sueldo,
+            "viaticos": viaticos,
+            "maniobra": maniobra,
+            "rule_applied": TRIP_RULE_PROVINCIA_FACTOR,
+        }
+
+    sueldo = _operator_money(op, "viaje_especial")
+    maniobra = _operator_money(op, PROVINCIA_SPECIAL_MANIOBRA_FIELD)
+
+    return {
+        "scheme": PAGO_SCHEME_SPECIAL,
+        "sueldo": sueldo,
+        "viaticos": 0.0,
+        "maniobra": maniobra,
+        "rule_applied": TRIP_RULE_PROVINCIA_SPECIAL,
+    }
+
+
+def _resolve_trip_and_operator_payment(
+    client_id: int,
+    destination: Destination,
+    operator_1: Operator,
+    operator_2: Operator | None,
+    kms_recorridos: float,
+) -> Dict[str, Any]:
+    destination_codigo = _normalize_ct(getattr(destination, "codigo", ""))
+    if not destination_codigo:
+        raise ApiError(
+            "El destino no tiene código. No se puede resolver CONVENIO.",
+            status_code=400,
+        )
+
+    convenio = _lookup_convenio(client_id, destination_codigo)
+    if not convenio:
+        raise ApiError(
+            f"No se encontró CONVENIO para destination_codigo={destination_codigo}.",
+            status_code=400,
+        )
+
+    td = _normalize_ct(getattr(convenio, "td", ""))
+    if not td:
+        raise ApiError(
+            "El convenio no tiene TD configurado. No se puede resolver el tipo de viaje.",
+            status_code=400,
+        )
+
+    kms_convenio = int(getattr(convenio, "kms", 0) or 0)
+    trip_label = _build_trip_label(td)
+
+    if td == "P":
+        op1_payment = _resolve_provincia_payment_for_operator(operator_1, kms_recorridos)
+        op2_payment = (
+            _resolve_provincia_payment_for_operator(operator_2, kms_recorridos)
+            if operator_2 is not None
+            else None
+        )
+        rule_applied = op1_payment["rule_applied"]
+    else:
+        op1_payment = _resolve_fixed_trip_payment_for_operator(operator_1, td)
+        op2_payment = (
+            _resolve_fixed_trip_payment_for_operator(operator_2, td)
+            if operator_2 is not None
+            else None
+        )
+        rule_applied = TRIP_RULE_FIXED_TD
+
+    return {
+        "destination": destination,
+        "trip_td": td,
+        "trip_type_label": trip_label,
+        "trip_rule_applied": rule_applied,
+        "trip_destination_codigo": destination_codigo,
+        "trip_destination_nombre": getattr(destination, "nombre", None),
+        "trip_kms_convenio": kms_convenio,
+        "op1": op1_payment,
+        "op2": op2_payment,
+    }
+
+
+def _apply_trip_resolution_to_liq(
+    liq: Liquidacion,
+    resolved: Dict[str, Any],
+):
+    liq.destination_id = int(resolved["destination"].id)
+
+    liq.trip_td = resolved.get("trip_td")
+    liq.trip_type_label = resolved.get("trip_type_label")
+    liq.trip_rule_applied = resolved.get("trip_rule_applied")
+    liq.trip_destination_codigo = resolved.get("trip_destination_codigo")
+    liq.trip_destination_nombre = resolved.get("trip_destination_nombre")
+    liq.trip_kms_convenio = resolved.get("trip_kms_convenio")
+
+    op1 = resolved.get("op1") or {}
+    liq.sueldo_base_op1 = round(float(op1.get("sueldo", 0) or 0), 2)
+    liq.viaticos_base_op1 = round(float(op1.get("viaticos", 0) or 0), 2)
+    liq.maniobra_op1 = round(float(op1.get("maniobra", 0) or 0), 2)
+    liq.pago_scheme_op1 = op1.get("scheme")
+
+    op2 = resolved.get("op2") or None
+    if liq.operator2_id and op2:
+        liq.sueldo_base_op2 = round(float(op2.get("sueldo", 0) or 0), 2)
+        liq.viaticos_base_op2 = round(float(op2.get("viaticos", 0) or 0), 2)
+        liq.maniobra_op2 = round(float(op2.get("maniobra", 0) or 0), 2)
+        liq.pago_scheme_op2 = op2.get("scheme")
+    else:
+        liq.sueldo_base_op2 = 0
+        liq.viaticos_base_op2 = 0
+        liq.maniobra_op2 = 0
+        liq.pago_scheme_op2 = None
+
+
+# -----------------------------------------------------------------------------
+# TALÓN INTERNO
+# -----------------------------------------------------------------------------
 
 def _require_series(client_id: int, folio: str) -> TalonSeries:
-    """
-    Exige que la serie exista y esté activa para ese cliente.
-    """
     folio_n = normalize_folio(folio)
     row = (
         db.session.query(TalonSeries)
@@ -330,13 +673,6 @@ def _require_series(client_id: int, folio: str) -> TalonSeries:
 
 
 def _get_or_init_series_counter_locked(client_id: int, folio: str) -> TalonSeriesCounter:
-    """
-    Obtiene el contador con lock (FOR UPDATE). Si no existe, lo crea.
-    seq guarda el último consecutivo utilizado.
-
-    Maneja concurrencia:
-    - intenta crear con SAVEPOINT; si choca, relee con lock.
-    """
     folio_n = normalize_folio(folio)
 
     row = (
@@ -373,10 +709,6 @@ def _get_or_init_series_counter_locked(client_id: int, folio: str) -> TalonSerie
 
 
 def _allocate_next_talon_locked(client_id: int, folio: str) -> tuple[str, str, int]:
-    """
-    Reserva el siguiente consecutivo de manera segura (lock) y regresa:
-      (talon_interno, talon_folio, talon_seq)
-    """
     series = _require_series(client_id, folio)
     ctr = _get_or_init_series_counter_locked(client_id, series.folio)
 
@@ -386,16 +718,11 @@ def _allocate_next_talon_locked(client_id: int, folio: str) -> tuple[str, str, i
     ctr.seq = int(next_seq)
     db.session.flush()
 
-    # Para auto-sugerencia/asignación, sí respeta padding del catálogo
     talon = format_talon(series.folio, next_seq, int(series.padding or 5))
     return talon, series.folio, int(next_seq)
 
 
 def _ensure_counter_at_least_locked(client_id: int, folio: str, seq_used: int) -> None:
-    """
-    Si el usuario mandó un talón manual (ej. NIC36), garantizamos que el contador
-    quede >= seq_used para que el siguiente auto sea el siguiente consecutivo.
-    """
     series = _require_series(client_id, folio)
     ctr = _get_or_init_series_counter_locked(client_id, series.folio)
 
@@ -405,13 +732,11 @@ def _ensure_counter_at_least_locked(client_id: int, folio: str, seq_used: int) -
         db.session.flush()
 
 
-# ------------------  IMSS MENSUAL (OperatorIMSS) ------------------
+# -----------------------------------------------------------------------------
+# IMSS MENSUAL
+# -----------------------------------------------------------------------------
 
 def _find_operator_imss_for_month(client_id: int, operator_id: int, fecha: date | None) -> OperatorIMSS | None:
-    """
-    Busca la cuota IMSS del operador para el mes/año de la fecha de la liquidación.
-    Soporta columna 'activo' si existe en el modelo.
-    """
     if not fecha:
         return None
 
@@ -431,12 +756,6 @@ def _find_operator_imss_for_month(client_id: int, operator_id: int, fecha: date 
 
 
 def _upsert_imss_deduccion_for_slot(liq: Liquidacion, client_id: int, slot: int, operator_id: int) -> None:
-    """
-    Inserta la deducción IMSS como renglón automático (key='imss') leyendo OperatorIMSS (mensual).
-    Regla:
-      - Si no hay registro mensual, no agrega nada.
-      - Si la cuota <= 0, no agrega nada.
-    """
     row = _find_operator_imss_for_month(client_id, operator_id, getattr(liq, "fecha", None))
     if not row:
         return
@@ -462,9 +781,6 @@ def _upsert_imss_deduccion_for_slot(liq: Liquidacion, client_id: int, slot: int,
 
 
 def _strip_generated_imss_deducciones(liq: Liquidacion) -> None:
-    """
-    Quita renglones automáticos de IMSS (key='imss') para poder regenerarlos limpios.
-    """
     kept: List[LiquidacionDeduccion] = []
     for d in (liq.deducciones or []):
         key = (d.key or "").strip()
@@ -474,13 +790,15 @@ def _strip_generated_imss_deducciones(liq: Liquidacion) -> None:
     liq.deducciones = kept
 
 
-# ------------------  DEDUCCIONES CONFIG (DB) ------------------
+# -----------------------------------------------------------------------------
+# DEDUCCIONES CONFIG
+# -----------------------------------------------------------------------------
 
 def _cfg_default() -> Dict[str, Any]:
     return {
         "global": {
             "ayuda_escolar": "0",
-            "impuestos": "0",  # en liquidación se calcula, pero lo dejamos por compatibilidad
+            "impuestos": "0",
             "infonavit": "0",
             "sindicato": "0",
             "fonacot": "0",
@@ -492,12 +810,6 @@ def _cfg_default() -> Dict[str, Any]:
 
 
 def _load_cfg(client_id: int) -> Dict[str, Any]:
-    """
-    El modelo real usa columnas:
-      - global_json
-      - per_operator_json
-      - global_extras_json
-    """
     row = (
         db.session.query(ClientDeduccionesConfig)
         .filter(ClientDeduccionesConfig.client_id == client_id)
@@ -541,11 +853,6 @@ def _to_float_money(v: Any) -> float:
 def _resolve_effective_for_operator(
     cfg: Dict[str, Any], operator_id: int
 ) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
-    """
-    Retorna:
-      - fields dict key->float (solo fijas)
-      - extras list [{id,label,monto,enabled}]
-    """
     global_fields = cfg.get("global") or {}
     global_extras = cfg.get("global_extras") or []
     per_operator = cfg.get("per_operator") or {}
@@ -630,15 +937,6 @@ def _resolve_effective_for_operator(
 
 
 def _strip_generated_cfg_deducciones(liq: Liquidacion):
-    """
-    Quita renglones “generados por config” para poder reinsertarlos limpios:
-      - preset keys (except impuestos)
-      - cfg_extra:*
-    NO quita:
-      - impuestos (lo maneja recalc_totals)
-      - op_extra:* (pagos aplicados a saldos)
-      - deducciones manuales (key=None o keys custom)
-    """
     kept: List[LiquidacionDeduccion] = []
     for d in (liq.deducciones or []):
         key = (d.key or "").strip()
@@ -651,10 +949,6 @@ def _strip_generated_cfg_deducciones(liq: Liquidacion):
 
 
 def _upsert_cfg_deducciones_for_slot(liq: Liquidacion, client_id: int, slot: int, operator_id: int):
-    """
-    Inserta deducciones “fijas” (ayuda_escolar, infonavit, etc) + extras globales/override,
-    como renglones en LiquidacionDeduccion.
-    """
     cfg = _load_cfg(client_id)
     fields, extras = _resolve_effective_for_operator(cfg, operator_id)
 
@@ -698,11 +992,6 @@ def _upsert_cfg_deducciones_for_slot(liq: Liquidacion, client_id: int, slot: int
 
 
 def _apply_operator_extra_payments(liq: Liquidacion, client_id: int, payments: List[Dict[str, Any]]):
-    """
-    OperatorDeduccionExtra usa:
-      - activo
-      - saldo_restante
-    """
     if not payments:
         return
 
@@ -774,6 +1063,10 @@ def _apply_operator_extra_payments(liq: Liquidacion, client_id: int, payments: L
         )
 
 
+# -----------------------------------------------------------------------------
+# Serialización
+# -----------------------------------------------------------------------------
+
 def _serialize_deduccion(d: LiquidacionDeduccion):
     return {
         "id": d.id,
@@ -798,10 +1091,6 @@ def _serialize_anticipo(a: LiquidacionAnticipo):
 
 
 def _serialize_detalle(det: Any) -> Dict[str, Any]:
-    """
-    Serializa LiquidacionDetalle si existe en tu modelo/relación.
-    Esto es opcional y no rompe si el modelo no está presente en runtime.
-    """
     return {
         "id": getattr(det, "id", None),
         "row_number": getattr(det, "row_number", None),
@@ -846,6 +1135,14 @@ def _serialize(liq: Liquidacion):
         "car_id": liq.car_id,
         "destination_id": liq.destination_id,
         "car_type": liq.car_type,
+        "trip_td": getattr(liq, "trip_td", None),
+        "trip_type_label": getattr(liq, "trip_type_label", None),
+        "trip_rule_applied": getattr(liq, "trip_rule_applied", None),
+        "trip_destination_codigo": getattr(liq, "trip_destination_codigo", None),
+        "trip_destination_nombre": getattr(liq, "trip_destination_nombre", None),
+        "trip_kms_convenio": getattr(liq, "trip_kms_convenio", None),
+        "pago_scheme_op1": getattr(liq, "pago_scheme_op1", None),
+        "pago_scheme_op2": getattr(liq, "pago_scheme_op2", None),
         "kms": float(liq.kms or 0),
         "tarifa": float(liq.tarifa or 0),
         "subtotal": float(liq.subtotal or 0),
@@ -894,7 +1191,6 @@ def _serialize(liq: Liquidacion):
     for f in EXPENSE_IVA_PCT_FIELDS:
         data[f] = float(getattr(liq, f, 0) or 0)
 
-    # Detalles (si existe relación Liquidacion.detalles)
     if hasattr(liq, "detalles") and getattr(liq, "detalles") is not None:
         try:
             data["detalles"] = [_serialize_detalle(d) for d in (liq.detalles or [])]
@@ -914,6 +1210,10 @@ def _serialize(liq: Liquidacion):
     return data
 
 
+# -----------------------------------------------------------------------------
+# FOLIO LIQUIDACION
+# -----------------------------------------------------------------------------
+
 def _get_or_init_counter_locked(client_id: int) -> ClientCounter:
     ctr = (
         db.session.query(ClientCounter)
@@ -922,7 +1222,6 @@ def _get_or_init_counter_locked(client_id: int) -> ClientCounter:
         .one_or_none()
     )
     if not ctr:
-        # tolerancia a carrera: savepoint
         try:
             with db.session.begin_nested():
                 db.session.add(ClientCounter(client_id=client_id, liquidacion_folio_seq=0))
@@ -953,9 +1252,6 @@ def _allocate_next_folio(client_id: int) -> tuple[int, str]:
 
 
 def _load_liq_full(client_id: int, liq_id: int) -> Liquidacion | None:
-    """
-    Carga liquidación con deducciones y anticipos (+ detalles si existe la relación).
-    """
     opts = [
         selectinload(Liquidacion.deducciones),
         selectinload(Liquidacion.anticipos),
@@ -971,7 +1267,9 @@ def _load_liq_full(client_id: int, liq_id: int) -> Liquidacion | None:
     )
 
 
-# ---------------- endpoints ----------------
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
 
 @liquidaciones_bp.get("/next-folio")
 def next_folio(client_id: int):
@@ -982,38 +1280,6 @@ def next_folio(client_id: int):
     ctr = db.session.query(ClientCounter).filter(ClientCounter.client_id == client_id).one_or_none()
     nxt = (int(ctr.liquidacion_folio_seq or 0) if ctr else 0) + 1
     return jsonify({"folio_num": int(nxt), "folio": Liquidacion.format_folio(int(nxt))})
-
-
-# @liquidaciones_bp.post("/import-excel")
-# def import_excel(client_id: int):
-#     """
-#     Importa/valida Excel de viajes por talón interno.
-
-#     - multipart/form-data con campo: file
-#     - query param: dry_run=1 para solo validar (no persiste ni actualiza contadores)
-#     """
-#     _, err = _validate_client(client_id)
-#     if err:
-#         return err
-
-#     dry_run = _parse_bool(request.args.get("dry_run"))
-#     dry_run = bool(dry_run is True)
-
-#     f = request.files.get("file")
-#     if not f:
-#         return _err("Falta archivo (campo 'file').", 400)
-
-#     try:
-#         result = import_liquidaciones_from_excel(
-#             client_id=int(client_id),
-#             file_storage=f,
-#             dry_run=dry_run,
-#         )
-#         return jsonify(result), 200
-#     except ApiError as e:
-#         return _err(str(e), e.status_code or 400)
-#     except Exception as e:
-#         return _err(f"No se pudo importar el Excel. {str(e)}", 400)
 
 
 @liquidaciones_bp.route("/", methods=["GET"], strict_slashes=False)
@@ -1032,7 +1298,6 @@ def list_liquidaciones(client_id: int):
     activo = _parse_bool(request.args.get("activo"))
     search = (request.args.get("search") or "").strip()
 
-    # Por performance: listar trae deducciones/anticipos. Detalles solo en GET /<id>
     q = (
         db.session.query(Liquidacion)
         .options(
@@ -1072,6 +1337,12 @@ def list_liquidaciones(client_id: int):
             filters.append(Liquidacion.talon_interno.ilike(like))
         if hasattr(Liquidacion, "talon_folio"):
             filters.append(Liquidacion.talon_folio.ilike(like))
+        if hasattr(Liquidacion, "trip_td"):
+            filters.append(Liquidacion.trip_td.ilike(like))
+        if hasattr(Liquidacion, "trip_destination_codigo"):
+            filters.append(Liquidacion.trip_destination_codigo.ilike(like))
+        if hasattr(Liquidacion, "trip_destination_nombre"):
+            filters.append(Liquidacion.trip_destination_nombre.ilike(like))
         q = q.filter(or_(*filters))
 
     q = q.order_by(Liquidacion.fecha.desc(), Liquidacion.id.desc())
@@ -1094,17 +1365,6 @@ def list_liquidaciones(client_id: int):
 @liquidaciones_bp.post("")
 @liquidaciones_bp.post("/")
 def create_liquidacion(client_id: int):
-    """
-    TALÓN:
-    - Si llega talon_interno: se normaliza CONTRA catálogo (serie activa) y se guarda TAL CUAL
-      (sin forzar padding). Luego se asegura contador >= seq.
-    - Si NO llega talon_interno y llega talon_folio/talon_series_folio: se reserva el siguiente consecutivo con lock,
-      y se formatea con padding del catálogo.
-    - Si no llega nada: se crea sin talón (legacy).
-
-    IMSS:
-    - IMSS se inserta automáticamente leyendo OperatorIMSS del mes/año de la fecha.
-    """
     _, err = _validate_client(client_id)
     if err:
         return err
@@ -1112,12 +1372,11 @@ def create_liquidacion(client_id: int):
     body = request.get_json(silent=True) or {}
 
     fecha_in = (body.get("fecha") or "").strip()
-
     operator_id = body.get("operator_id")
     operator2_id = body.get("operator2_id", None)
-
     car_id = body.get("car_id", None)
     destination_id = body.get("destination_id", None)
+    guide_ids = _validate_guide_ids_payload(body.get("guide_ids"))
 
     if operator_id is None:
         return _err("operator_id es obligatorio.", 400)
@@ -1191,12 +1450,11 @@ def create_liquidacion(client_id: int):
     if "car_type" in body and (body.get("car_type") not in (None, "", car_type_final)):
         return _err("No envíes 'car_type'. Se calcula automáticamente desde operador/carro.", 400)
 
-    maniobra_op1 = _num(body.get("maniobra_op1"), 0.0)
-    maniobra_op2 = _num(body.get("maniobra_op2"), 0.0)
+    # Otros ingresos sí se aceptan manualmente
     otros_op1 = _num(body.get("otros_ingresos_op1"), 0.0)
     otros_op2 = _num(body.get("otros_ingresos_op2"), 0.0)
-    if min(maniobra_op1, maniobra_op2, otros_op1, otros_op2) < 0:
-        return _err("Maniobra/otros ingresos no pueden ser negativos.", 400)
+    if min(otros_op1, otros_op2) < 0:
+        return _err("Otros ingresos no pueden ser negativos.", 400)
 
     expense_kwargs: Dict[str, Any] = {}
     for f in EXPENSE_FIELDS:
@@ -1225,15 +1483,11 @@ def create_liquidacion(client_id: int):
     if not isinstance(ant_list, list):
         return _err("anticipos debe ser una lista.", 400)
 
-    # -------------------------
-    # TALÓN: resolver (manual vs auto)
-    # -------------------------
     talon_interno: str | None = None
     talon_folio: str | None = None
     talon_seq: int | None = None
 
     raw_talon_interno = body.get("talon_interno", None)
-
     raw_talon_folio = body.get("talon_folio", None)
     if raw_talon_folio in (None, "", 0):
         raw_talon_folio = body.get("talon_series_folio", None)
@@ -1252,6 +1506,25 @@ def create_liquidacion(client_id: int):
         return _err(str(e), e.status_code or 400)
 
     try:
+        destination_obj = _resolve_destination_for_liquidacion(
+            client_id=client_id,
+            explicit_destination_id=destination_id,
+            guide_ids=guide_ids,
+        )
+
+        kms_recorridos = _extract_kms_recorridos_from_payload(
+            body,
+            default_kms=None,
+        )
+
+        trip_resolved = _resolve_trip_and_operator_payment(
+            client_id=client_id,
+            destination=destination_obj,
+            operator_1=op1,
+            operator_2=op2,
+            kms_recorridos=kms_recorridos,
+        )
+
         folio_num, folio_auto = _allocate_next_folio(client_id)
 
         liq = Liquidacion(
@@ -1265,7 +1538,7 @@ def create_liquidacion(client_id: int):
             operator_id=operator_id,
             operator2_id=operator2_id,
             car_id=car_id,
-            destination_id=destination_id,
+            destination_id=int(destination_obj.id),
             car_type=car_type_final,
             kms=round(kms, 2),
             tarifa=tarifa,
@@ -1276,16 +1549,12 @@ def create_liquidacion(client_id: int):
             status=status,
             observaciones=observaciones,
             activo=activo,
-            sueldo_base_op1=round(float(getattr(op1, "sueldo_op_1", 0) or 0), 2),
-            viaticos_base_op1=round(float(getattr(op1, "viaticos_op_1", 0) or 0), 2),
-            sueldo_base_op2=round(float(getattr(op2, "sueldo_op_2", 0) or 0), 2) if op2 else 0,
-            viaticos_base_op2=round(float(getattr(op2, "viaticos_op_2", 0) or 0), 2) if op2 else 0,
-            maniobra_op1=round(maniobra_op1, 2),
-            maniobra_op2=round(maniobra_op2, 2),
             otros_ingresos_op1=round(otros_op1, 2),
             otros_ingresos_op2=round(otros_op2, 2),
             **expense_kwargs,
         )
+
+        _apply_trip_resolution_to_liq(liq, trip_resolved)
 
         _upsert_cfg_deducciones_for_slot(liq, client_id, 1, operator_id)
         if operator2_id is not None:
@@ -1341,7 +1610,6 @@ def create_liquidacion(client_id: int):
         db.session.add(liq)
         db.session.flush()
 
-        # Si fue talón manual, aseguramos que el contador quede “alcanzado”
         if raw_talon_interno not in (None, "") and talon_folio and talon_seq:
             _ensure_counter_at_least_locked(client_id, talon_folio, int(talon_seq))
 
@@ -1379,18 +1647,6 @@ def get_liquidacion(client_id: int, liq_id: int):
 
 @liquidaciones_bp.patch("/<int:liq_id>")
 def update_liquidacion(client_id: int, liq_id: int):
-    """
-    TALÓN (UPDATE):
-    - Si llega talon_interno:
-        - "" / None => limpia talón
-        - valor => normaliza contra catálogo (serie activa) y guarda TAL CUAL (sin padding),
-                  y asegura contador >= seq
-    - Si llega talon_folio/talon_series_folio (y NO llega talon_interno):
-        - genera y reserva el siguiente consecutivo (lock) y lo formatea con padding
-
-    IMSS:
-    - IMSS se regenera automático desde OperatorIMSS (mensual) cada vez que se hace PATCH.
-    """
     _, err = _validate_client(client_id)
     if err:
         return err
@@ -1400,6 +1656,8 @@ def update_liquidacion(client_id: int, liq_id: int):
     liq = _load_liq_full(client_id, liq_id)
     if not liq:
         return _err("Liquidación no encontrada.", 404)
+
+    guide_ids = _validate_guide_ids_payload(body.get("guide_ids"))
 
     if "pagado" in body:
         liq.pagado = bool(body.get("pagado"))
@@ -1414,37 +1672,23 @@ def update_liquidacion(client_id: int, liq_id: int):
             return _err("Fecha inválida. Usa YYYY-MM-DD.", 400)
         liq.fecha = dt
 
-    if "destination_id" in body:
-        raw = body.get("destination_id")
-        try:
-            did = None if raw in ("", None) else int(raw)
-        except Exception:
-            return _err("destination_id inválido.", 400)
-
-        if did is not None:
-            try:
-                _get_destination_by_client(client_id, did)
-            except ApiError as e:
-                return _err(str(e), e.status_code or 400)
-
-        liq.destination_id = did
-
     operator_changed = "operator_id" in body
     car_changed = "car_id" in body
     operator2_changed = "operator2_id" in body
+    destination_changed = "destination_id" in body
 
     if operator_changed:
         try:
             op_id = int(body.get("operator_id"))
         except Exception:
             return _err("operator_id inválido.", 400)
+
         try:
             op_final = _get_operator_global(op_id)
         except ApiError as e:
             return _err(str(e), e.status_code or 400)
+
         liq.operator_id = op_id
-        liq.sueldo_base_op1 = round(float(getattr(op_final, "sueldo_op_1", 0) or 0), 2)
-        liq.viaticos_base_op1 = round(float(getattr(op_final, "viaticos_op_1", 0) or 0), 2)
     else:
         op_final = db.session.get(Operator, liq.operator_id)
         if not op_final:
@@ -1469,14 +1713,12 @@ def update_liquidacion(client_id: int, liq_id: int):
 
         liq.operator2_id = op2_id
 
-        if op2_final:
-            liq.sueldo_base_op2 = round(float(getattr(op2_final, "sueldo_op_2", 0) or 0), 2)
-            liq.viaticos_base_op2 = round(float(getattr(op2_final, "viaticos_op_2", 0) or 0), 2)
-        else:
+        if not op2_final:
             liq.sueldo_base_op2 = 0
             liq.viaticos_base_op2 = 0
             liq.maniobra_op2 = 0
             liq.otros_ingresos_op2 = 0
+            liq.pago_scheme_op2 = None
 
             liq.deducciones = [
                 d for d in (liq.deducciones or [])
@@ -1516,6 +1758,24 @@ def update_liquidacion(client_id: int, liq_id: int):
             liq.car_type = _derive_car_type(op_final, car_final)
         except ApiError as e:
             return _err(str(e), e.status_code or 400)
+
+    explicit_destination_id: int | None
+    if destination_changed:
+        raw = body.get("destination_id")
+        try:
+            explicit_destination_id = None if raw in ("", None) else int(raw)
+        except Exception:
+            return _err("destination_id inválido.", 400)
+
+        if explicit_destination_id is not None:
+            try:
+                _get_destination_by_client(client_id, explicit_destination_id)
+            except ApiError as e:
+                return _err(str(e), e.status_code or 400)
+
+        liq.destination_id = explicit_destination_id
+    else:
+        explicit_destination_id = liq.destination_id
 
     if "kms" in body:
         kms = _num(body.get("kms"), 0.0)
@@ -1561,9 +1821,6 @@ def update_liquidacion(client_id: int, liq_id: int):
     if "activo" in body:
         liq.activo = bool(body.get("activo"))
 
-    # -------------------------
-    # TALÓN (PATCH)
-    # -------------------------
     raw_talon_folio = body.get("talon_folio", None)
     if raw_talon_folio in (None, "", 0):
         raw_talon_folio = body.get("talon_series_folio", None)
@@ -1597,7 +1854,8 @@ def update_liquidacion(client_id: int, liq_id: int):
             except ApiError as e:
                 return _err(str(e), e.status_code or 400)
 
-    for f in ("maniobra_op1", "maniobra_op2", "otros_ingresos_op1", "otros_ingresos_op2"):
+    # Otros ingresos sí pueden cambiar manualmente
+    for f in ("otros_ingresos_op1", "otros_ingresos_op2"):
         if f in body:
             v = _num(body.get(f), 0.0)
             if v < 0:
@@ -1605,6 +1863,8 @@ def update_liquidacion(client_id: int, liq_id: int):
             if f.endswith("_op2") and not getattr(liq, "operator2_id", None):
                 return _err(f"No puedes enviar {f} sin operator2_id.", 400)
             setattr(liq, f, round(v, 2))
+
+    # Maniobras ya no se toman del frontend; se resuelven por backend.
 
     for f in EXPENSE_FIELDS:
         if f in body:
@@ -1620,8 +1880,44 @@ def update_liquidacion(client_id: int, liq_id: int):
                 return _err(f"{f} inválido (0 a 100).", 400)
             setattr(liq, f, round(float(v), 2))
 
-    # ------------------  DEDUCCIONES / ANTICIPOS ------------------
     try:
+        must_recompute_trip = any(
+            [
+                operator_changed,
+                operator2_changed,
+                car_changed,
+                destination_changed,
+                bool(guide_ids),
+                "kms" in body,
+                "kms_recorridos" in body,
+                "kms_sal" in body,
+                "kms_reg" in body,
+                getattr(liq, "trip_td", None) in (None, ""),
+            ]
+        )
+
+        if must_recompute_trip:
+            destination_obj = _resolve_destination_for_liquidacion(
+                client_id=client_id,
+                explicit_destination_id=liq.destination_id,
+                guide_ids=guide_ids,
+            )
+
+            kms_recorridos = _extract_kms_recorridos_from_payload(
+                body,
+                default_kms=getattr(liq, "trip_kms_convenio", None),
+            )
+
+            trip_resolved = _resolve_trip_and_operator_payment(
+                client_id=client_id,
+                destination=destination_obj,
+                operator_1=op_final,
+                operator_2=op2_final,
+                kms_recorridos=kms_recorridos,
+            )
+
+            _apply_trip_resolution_to_liq(liq, trip_resolved)
+
         if "deducciones" in body:
             ded_list = body.get("deducciones") or []
             if not isinstance(ded_list, list):
@@ -1790,7 +2086,6 @@ def update_liquidacion(client_id: int, liq_id: int):
     except ApiError as e:
         return _err(str(e), e.status_code or 400)
 
-    # Siempre re-sincroniza deducciones generadas por config (preset + cfg_extra) y regenera IMSS
     try:
         _strip_generated_cfg_deducciones(liq)
         _strip_generated_imss_deducciones(liq)
